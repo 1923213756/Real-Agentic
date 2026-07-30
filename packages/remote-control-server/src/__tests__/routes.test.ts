@@ -693,6 +693,34 @@ describe('V1 Session Routes', () => {
     expect(archiveRes.status).toBe(200)
   })
 
+  test('POST /v1/sessions/:id/archive — terminates a stale-offline child', async () => {
+    const environment = storeCreateEnvironment({
+      secret: 'v1-archive-terminate-secret',
+      accountId: 'acct-1',
+    })
+    const session = storeCreateSession({ environmentId: environment.id })
+    storeUpsertSessionWorker(session.id, { workerStatus: 'offline' })
+
+    const archiveRes = await app.request(`/v1/sessions/${session.id}/archive`, {
+      method: 'POST',
+      headers: AUTH_HEADERS,
+    })
+    expect(archiveRes.status).toBe(200)
+
+    // The v1 route never looked at worker status at all, so it orphaned every
+    // child it archived. The reclaim now lives in archiveSession itself.
+    const commands = getPersistence().listPendingEnvironmentCommands(
+      environment.id,
+    )
+    expect(
+      commands.some(
+        command =>
+          command.kind === 'terminate_session' &&
+          (command.payload as Record<string, unknown>).sessionId === session.id,
+      ),
+    ).toBe(true)
+  })
+
   test('POST /v1/sessions/:id/archive — archives compat code session IDs', async () => {
     const createRes = await app.request('/v1/code/sessions', {
       method: 'POST',
@@ -2355,6 +2383,59 @@ describe('Web Session Routes', () => {
     ).toBe(true)
   })
 
+  test('POST /web/sessions/:id/archive — terminates a stale-offline child', async () => {
+    const environment = storeCreateEnvironment({
+      secret: 'archive-terminate-secret',
+      accountId: 'web:user-1',
+    })
+    const session = storeCreateSession({ environmentId: environment.id })
+    storeBindSession(session.id, 'user-1')
+    // Same drift as the DELETE case: archiving used to only flip the DB row,
+    // leaving the child alive and pinning a capacity slot forever.
+    storeUpsertSessionWorker(session.id, { workerStatus: 'offline' })
+
+    const res = await app.request(
+      `/web/sessions/${session.id}/archive?uuid=user-1`,
+      { method: 'POST' },
+    )
+    expect(res.status).toBe(200)
+    expect(storeGetSession(session.id)?.status).toBe('archived')
+
+    const commands = getPersistence().listPendingEnvironmentCommands(
+      environment.id,
+    )
+    expect(
+      commands.some(
+        command =>
+          command.kind === 'terminate_session' &&
+          (command.payload as Record<string, unknown>).sessionId === session.id,
+      ),
+    ).toBe(true)
+  })
+
+  test('POST /web/sessions/:id/archive — no terminate when the session never had a worker', async () => {
+    const environment = storeCreateEnvironment({
+      secret: 'archive-no-worker-secret',
+      accountId: 'web:user-1',
+    })
+    const session = storeCreateSession({ environmentId: environment.id })
+    storeBindSession(session.id, 'user-1')
+
+    const res = await app.request(
+      `/web/sessions/${session.id}/archive?uuid=user-1`,
+      { method: 'POST' },
+    )
+    expect(res.status).toBe(200)
+
+    // No child was ever spawned, so the control lane stays quiet.
+    const commands = getPersistence().listPendingEnvironmentCommands(
+      environment.id,
+    )
+    expect(commands.some(command => command.kind === 'terminate_session')).toBe(
+      false,
+    )
+  })
+
   test('GET /web/sessions/:id — returns owned session', async () => {
     const createRes = await app.request('/web/sessions?uuid=user-1', {
       method: 'POST',
@@ -3078,6 +3159,54 @@ describe('Web Control Routes', () => {
         provider_id: 'custom-openai',
         model_profile_id: 'model-b',
         operation_id: 'model-switch-online',
+      },
+    })
+  })
+
+  test('POST /web/sessions/:id/control — forwards live switches for an idle (not just online) worker', async () => {
+    // An idle worker is a connected child that applies the switch live. It must
+    // NOT be treated as offline/deferred, or the switch silently waits for a
+    // "next launch" that never comes while the child stays alive on the old model.
+    const environment = storeCreateEnvironment({
+      secret: 'model-switch-idle-secret',
+      accountId: 'web:user-1',
+      capabilities: providerCatalogCapabilities('model-a'),
+    })
+    const session = storeCreateSession({ environmentId: environment.id })
+    storeBindSession(session.id, 'user-1')
+    storeUpsertSessionWorker(session.id, { workerStatus: 'idle' })
+
+    const res = await app.request(
+      `/web/sessions/${session.id}/control?uuid=user-1`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'control_request',
+          request: {
+            subtype: 'set_session_model',
+            provider_id: 'custom-openai',
+            model_profile_id: 'model-b',
+            operation_id: 'model-switch-idle',
+            expected_provider_config_revision: 4,
+          },
+        }),
+      },
+    )
+
+    expect(res.status).toBe(200)
+    expect(await resJson(res)).toMatchObject({
+      status: 'accepted',
+      deferred: false,
+      awaiting_worker_confirmation: true,
+      operation_id: 'model-switch-idle',
+    })
+    expect(
+      getPersistence().listEvents(session.id, 0, 100).events.at(-1)?.payload,
+    ).toMatchObject({
+      request: {
+        subtype: 'set_session_model',
+        operation_id: 'model-switch-idle',
       },
     })
   })

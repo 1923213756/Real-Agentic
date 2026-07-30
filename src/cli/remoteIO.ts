@@ -29,6 +29,31 @@ import type { Transport } from './transports/Transport.js'
 import { getTransportForUrl } from './transports/transportUtils.js'
 
 /**
+ * Terminate a bridge worker child that a newer worker has superseded (409
+ * epoch mismatch). RemoteIO runs only in headless `--print` bridge workers
+ * (constructed in print.ts on the sdkUrl path), so an immediate hard exit is
+ * always correct — the superseded worker's writes are already rejected and it
+ * must free its capacity slot at once.
+ *
+ * We self-SIGKILL rather than call process.exit(1): process.exit runs the
+ * synchronous `process.on('exit')` handlers, and one of them can wedge the
+ * worker at 100% CPU after an epoch mismatch (observed live — the child logs
+ * "shutting down" then spins forever, orphaning itself and pinning a capacity
+ * slot). SIGKILL is kernel-enforced and preempts any such spinning handler.
+ * The trailing process.exit both satisfies the `never` contract and covers the
+ * unusual platform where self-signalling is unavailable.
+ */
+function terminateSupersededWorker(): never {
+  try {
+    process.kill(process.pid, 'SIGKILL')
+  } catch {
+    // Fall through to the guaranteed-`never` terminator below.
+  }
+  // eslint-disable-next-line custom-rules/no-process-exit
+  process.exit(1)
+}
+
+/**
  * Bidirectional streaming for SDK mode with session tracking
  * Supports WebSocket transport
  */
@@ -123,7 +148,9 @@ export class RemoteIO extends StructuredIO {
           'CCR v2 requires SSETransport; check getTransportForUrl',
         )
       }
-      this.ccrClient = new CCRClient(this.transport, this.url)
+      this.ccrClient = new CCRClient(this.transport, this.url, {
+        onEpochMismatch: terminateSupersededWorker,
+      })
       const init = this.ccrClient.initialize()
       this.restoredWorkerState = init.catch(() => null)
       init.catch((error: unknown) => {

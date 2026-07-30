@@ -446,6 +446,19 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
       const lastStderr: string[] = []
       let sigkillSent = false
       let firstUserMessageSeen = false
+      // Turn state for capacity decisions. `busy` must mean strictly "a turn is
+      // running", with no path that latches it on: spawns from rebind and
+      // re-dispatch never receive a turn, and a child that started busy would
+      // wait forever for the result that clears it — pinning a capacity slot
+      // permanently, the exact failure this policy exists to remove. The spawn
+      // window is protected by lastActivityAt instead: a fresh child is the
+      // most recently active, so LRU reaches it last.
+      let busy = false
+      let lastActivityAt = Date.now()
+      const markTurnStarted = (): void => {
+        busy = true
+        lastActivityAt = Date.now()
+      }
 
       // Buffer stderr for error diagnostics
       if (child.stderr) {
@@ -495,6 +508,12 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
             }
             activities.push(activity)
             currentActivity = activity
+            lastActivityAt = activity.timestamp
+            // 'result' (success) and 'error' both close a turn; the process
+            // stays alive waiting for the next user message, which is exactly
+            // the resident-but-idle state eviction targets.
+            if (activity.type === 'result' || activity.type === 'error')
+              busy = false
 
             deps.onActivity?.(opts.sessionId, activity)
           }
@@ -528,15 +547,17 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
                   )
                 }
                 // interrupt is turn-level; the child handles it internally (print.ts)
-              } else if (
-                msg.type === 'user' &&
-                !firstUserMessageSeen &&
-                opts.onFirstUserMessage
-              ) {
-                const text = extractUserMessageText(msg)
-                if (text) {
-                  firstUserMessageSeen = true
-                  opts.onFirstUserMessage(text)
+              } else if (msg.type === 'user') {
+                // A replayed user message means a turn has begun. The signal
+                // was already on the wire (--replay-user-messages) but was only
+                // ever consumed once, to derive the title.
+                markTurnStarted()
+                if (!firstUserMessageSeen && opts.onFirstUserMessage) {
+                  const text = extractUserMessageText(msg)
+                  if (text) {
+                    firstUserMessageSeen = true
+                    opts.onFirstUserMessage(text)
+                  }
                 }
               }
             }
@@ -587,6 +608,13 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
         get currentActivity(): SessionActivity | null {
           return currentActivity
         },
+        get busy(): boolean {
+          return busy
+        },
+        get lastActivityAt(): number {
+          return lastActivityAt
+        },
+        markTurnStarted,
         kill(): void {
           if (!child.killed) {
             deps.onDebug(

@@ -30,6 +30,7 @@ import {
   storeGetPendingWorkItem,
   storeUpdateSession,
   storeUpdateEnvironment,
+  storeUpsertSessionWorker,
   storeClearPersistentCachesForTests,
   storeHydratePersistentState,
 } from '../store'
@@ -297,6 +298,65 @@ describe('Code product lifecycle', () => {
     expect(storeGetProject(project.id)).toBeUndefined()
     expect(storeListSessionsByProject(project.id)).toEqual([])
   })
+
+  test('reaps every session child before hard-deleting the project', async () => {
+    const project = upsertCodeProject('owner-1', {
+      deviceId: 'device-1',
+      canonicalPath: '/real/repo',
+      workspaceKey: 'wrk-1',
+      gitRoot: '/real/repo',
+      gitRepoUrl: null,
+    })
+    const environment = storeCreateEnvironment({
+      secret: 'secret',
+      deviceId: 'device-1',
+    })
+    await createCodeProductSession(
+      {
+        ownerId: 'owner-1',
+        accountId: environment.accountId,
+        environmentId: environment.id,
+        requestedDirectory: '/real/repo',
+        title: 'Session',
+        permissionMode: 'default',
+      },
+      {
+        resolveWorkspace: async () => ({
+          deviceId: 'device-1',
+          canonicalPath: '/real/repo',
+          workspaceKey: 'wrk-1',
+          gitRoot: '/real/repo',
+          gitRepoUrl: null,
+        }),
+      },
+    )
+    const sessionIds = storeListSessionsByProject(project.id).map(s => s.id)
+    expect(sessionIds).toHaveLength(1)
+    for (const id of sessionIds) {
+      storeUpsertSessionWorker(id, { workerStatus: 'offline' })
+    }
+
+    expect(archiveCodeProject(project.id, 'owner-1').state).toBe('archived')
+    await recordWorkspaceProbe(
+      project.id,
+      { online: true, exists: false },
+      1000,
+    )
+    await recordWorkspaceProbe(
+      project.id,
+      { online: true, exists: false },
+      1_000 + MISSING_RECHECK_MS,
+    )
+    expect(storeGetProject(project.id)).toBeUndefined()
+
+    // This path deletes through the store, bypassing deleteSession — without an
+    // explicit reclaim one vanished workspace orphans every child it owned.
+    const terminated = getPersistence()
+      .listPendingEnvironmentCommands(environment.id)
+      .filter(command => command.kind === 'terminate_session')
+      .map(command => (command.payload as Record<string, unknown>).sessionId)
+    expect(terminated.sort()).toEqual(sessionIds.sort())
+  })
 })
 
 // ---------- Session Service ----------
@@ -458,6 +518,43 @@ describe('Session Service', () => {
       ).toEqual([{ type: 'session_status', seqNum: 1 }])
       expect(getAllEventBuses().has(s.id)).toBe(true)
       unsubscribe()
+    })
+
+    test('reaps the child, and re-archiving stays safe for orphan recovery', () => {
+      const environment = storeCreateEnvironment({ secret: 'archive-reap' })
+      const session = storeCreateSession({ environmentId: environment.id })
+      // worker_status drifts to offline while the child is still alive.
+      storeUpsertSessionWorker(session.id, { workerStatus: 'offline' })
+
+      expect(archiveSession(session.id)).toBe('changed')
+      const terminates = () =>
+        getPersistence()
+          .listPendingEnvironmentCommands(environment.id)
+          .filter(
+            command =>
+              command.kind === 'terminate_session' &&
+              (command.payload as Record<string, unknown>).sessionId ===
+                session.id,
+          )
+      expect(terminates()).toHaveLength(1)
+
+      // Re-archiving is how a user heals an orphan left by an earlier miss, so
+      // it must not throw on the still-pending terminate's dedupe key.
+      expect(() => archiveSession(session.id)).not.toThrow()
+      expect(archiveSession(session.id)).toBe('unchanged')
+      expect(terminates()).toHaveLength(1)
+    })
+
+    test('skips the reclaim when the session never had a worker', () => {
+      const environment = storeCreateEnvironment({ secret: 'archive-noreap' })
+      const session = storeCreateSession({ environmentId: environment.id })
+
+      expect(archiveSession(session.id)).toBe('changed')
+      expect(
+        getPersistence()
+          .listPendingEnvironmentCommands(environment.id)
+          .some(command => command.kind === 'terminate_session'),
+      ).toBe(false)
     })
 
     test('releases an idle bus after archiving', () => {

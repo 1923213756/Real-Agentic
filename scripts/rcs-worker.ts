@@ -53,7 +53,16 @@ try {
       dir: process.env.RCS_WORKER_DIR || process.cwd(),
       name: process.env.RCS_WORKER_NAME || 'rcs-worker',
       spawnMode: spawnMode(process.env.CLAUDE_BRIDGE_SPAWN_MODE),
-      capacity: positiveInteger(process.env.CLAUDE_BRIDGE_MAX_SESSIONS, 4),
+      // Resident children are bounded by memory (~180MB each plus their MCP
+      // helpers); concurrent turns by CPU and model-API rate. Idle residents
+      // above the cap are evicted rather than blocking new sessions, so this
+      // is a warm-cache size, not a limit on how many conversations can exist.
+      capacity: positiveInteger(
+        process.env.CLAUDE_BRIDGE_MAX_RESIDENT ??
+          process.env.CLAUDE_BRIDGE_MAX_SESSIONS,
+        16,
+      ),
+      busyCapacity: positiveInteger(process.env.CLAUDE_BRIDGE_MAX_BUSY, 8),
       permissionMode: process.env.CLAUDE_BRIDGE_PERMISSION_MODE,
       sandbox: process.env.CLAUDE_BRIDGE_SANDBOX === '1',
       sessionTimeoutMs: positiveInteger(
