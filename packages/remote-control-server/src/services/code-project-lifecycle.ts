@@ -8,6 +8,7 @@ import {
 } from '../store'
 import { removeEventBus } from '../transport/event-bus'
 import { runEnvironmentCommand } from './environment-command'
+import { terminateSessionChildBestEffort } from './session'
 
 export const MISSING_RECHECK_MS = 5 * 60_000
 
@@ -40,6 +41,13 @@ export async function recordWorkspaceProbe(
     return 'confirmed'
   }
 
+  // This batch delete goes straight to the store, bypassing deleteSession and
+  // the reclaim it performs, so reap each child here — and before the delete,
+  // while the session rows still resolve to an owning environment. Otherwise a
+  // single vanished workspace orphans every one of its sessions' children.
+  for (const session of storeListSessionsByProject(project.id)) {
+    terminateSessionChildBestEffort(session.id)
+  }
   const deletedSessionIds = storeDeleteProjectWithSessions(project.id)
   for (const sessionId of deletedSessionIds ?? []) removeEventBus(sessionId)
   return deletedSessionIds ? 'deleted' : 'ignored'

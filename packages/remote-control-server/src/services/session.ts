@@ -34,6 +34,8 @@ import { resolveSessionModelSelection } from './provider-catalog'
 const CODE_SESSION_PREFIX = 'cse_'
 const WEB_SESSION_PREFIX = 'session_'
 const CLOSED_SESSION_STATUSES = new Set(['archived'])
+/** Attribution for environment commands raised by lifecycle code, not a user. */
+const SYSTEM_OWNER_ID = 'system'
 
 function toModelSelectionPayload(
   selection: SessionModelSelection | null,
@@ -357,6 +359,11 @@ export type SessionLifecycleResult = 'changed' | 'unchanged' | 'missing'
 export function archiveSession(sessionId: string): SessionLifecycleResult {
   const session = storeGetSession(sessionId)
   if (!session) return 'missing'
+  // Reap before the state flip. Archiving only wrote the DB row, so a child
+  // whose worker_status had already drifted to "offline" kept running and
+  // pinned a capacity slot forever. Deliberately ahead of the already-archived
+  // return: re-archiving is then a way to heal an orphan left by an earlier miss.
+  terminateSessionChildBestEffort(sessionId)
   if (session.status === 'archived') return 'unchanged'
   if (!storeUpdateSession(sessionId, { status: 'archived' })) return 'missing'
   publishSessionEvent(
@@ -388,6 +395,10 @@ export function restoreSession(sessionId: string): SessionLifecycleResult {
 }
 
 export function deleteSession(sessionId: string): boolean {
+  // Must precede the delete: the reclaim resolves the owning environment
+  // through the session row, which is gone afterwards. Covers the batch
+  // callers (chat cleanup, project teardown) that never reaped children.
+  terminateSessionChildBestEffort(sessionId)
   if (!storeDeleteSession(sessionId)) return false
   removeEventBus(sessionId)
   return true
@@ -501,36 +512,54 @@ export function requestSessionTermination(
  *
  * The DB `worker_status` tracks the work-item lifecycle and can read "offline"
  * while the bridge's in-memory child process is still alive (their liveness
- * drifts apart). Deleting such a session with a plain DB delete orphans the
+ * drifts apart). Ending such a session with a plain DB write orphans the
  * child: it keeps running, reconnecting to a session the server no longer
  * knows about, and pins one of the worker's bounded capacity slots forever.
  * This enqueues a terminate down the Control Lane (delivered even when the
  * worker is at capacity, since capacity-full workers still poll that lane) so
- * the child is reaped regardless of the stale status. No-op when the session
- * has no bound, active environment.
+ * the child is reaped regardless of the stale status.
+ *
+ * Called from the session-lifecycle service functions themselves rather than
+ * from each route, so a new lifecycle path cannot forget to reap. No-op when
+ * the session was never given a worker, or has no bound active environment.
+ *
+ * `ownerId` is attribution only (stored on the command, never authorized
+ * against), so system-initiated reclaims pass the default.
  */
 export function terminateSessionChildBestEffort(
   sessionId: string,
-  ownerId: string,
+  ownerId: string = SYSTEM_OWNER_ID,
 ): void {
   const session = storeGetSession(sessionId)
   if (!session) return
+  // A session_worker row means a child CLI was spawned at some point. Without
+  // one there is nothing to reap, and skipping keeps the Control Lane quiet.
+  if (!storeGetSessionWorker(sessionId)) return
   const environment = session.environmentId
     ? storeGetEnvironment(session.environmentId)
     : undefined
   if (!environment || environment.status !== 'active') return
   const operationId = randomUUID()
-  createEnvironmentCommand({
-    environmentId: environment.id,
-    ownerId,
-    kind: 'terminate_session',
-    operationId,
-    dedupeKey: `terminate:${sessionId}`,
-    payload: { sessionId, operationId, graceMs: 1500 },
-    priority: 0,
-    expiresAt: Date.now() + 30_000,
-    maxAttempts: 3,
-  })
+  try {
+    createEnvironmentCommand({
+      environmentId: environment.id,
+      ownerId,
+      kind: 'terminate_session',
+      operationId,
+      dedupeKey: `terminate:${sessionId}`,
+      payload: { sessionId, operationId, graceMs: 1500 },
+      priority: 0,
+      expiresAt: Date.now() + 30_000,
+      maxAttempts: 3,
+    })
+  } catch {
+    // environment_commands has a unique index on (environment_id, dedupe_key)
+    // for pending/dispatched rows, so enqueuing while an earlier terminate for
+    // this session is still in flight raises a constraint error. That already
+    // guarantees the outcome we want, and the reclaim must never fail the
+    // lifecycle operation that triggered it — archiving a session cannot 500
+    // over a reaping detail.
+  }
 }
 
 export type SessionRebindResult =
@@ -560,6 +589,10 @@ export function rebindSessionEnvironment(
     return 'missing_environment'
   }
 
+  // Reap on the OLD environment before the row points at the new one —
+  // afterwards the reclaim would resolve the wrong bridge and the previous
+  // child would keep running against a session that has moved away.
+  terminateSessionChildBestEffort(sessionId)
   storeUpdateSession(sessionId, { environmentId, status: 'idle' })
   updateSessionWorkerStatus(sessionId, 'offline')
   ensureWorkItem(environmentId, sessionId)

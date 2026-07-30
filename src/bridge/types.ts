@@ -224,7 +224,19 @@ export type BridgeConfig = {
   machineName: string
   branch: string
   gitRepoUrl: string | null
+  /**
+   * Cap on resident session children — the memory bound, since each child
+   * holds its own CLI plus MCP helpers. Idle children above this line are
+   * evicted (their context rehydrates on respawn) rather than blocking work.
+   * 0 means unlimited, matching --max-sessions.
+   */
   maxSessions: number
+  /**
+   * Cap on children executing a turn — the CPU and model-API bound. Work
+   * beyond it queues without disturbing warm idle children. Defaults to
+   * maxSessions, i.e. no separate limit.
+   */
+  maxBusySessions?: number
   spawnMode: SpawnMode
   verbose: boolean
   sandbox: boolean
@@ -356,6 +368,20 @@ export type SessionHandle = {
   writeStdin(data: string): void // write directly to child stdin
   /** Update the access token for a running session (e.g. after token refresh). */
   updateAccessToken(token: string): void
+  /**
+   * True between a turn starting and its result arriving. Capacity decisions
+   * read this to keep mid-turn children off the eviction list.
+   */
+  busy: boolean
+  /** Epoch ms of the last turn boundary — the LRU key for eviction. */
+  lastActivityAt: number
+  /**
+   * Mark a turn as started when handing work to an already-resident child.
+   * The child only reports the turn once it echoes the replayed user message,
+   * and treating it as idle in that window would let a concurrent admission
+   * evict a session that is about to work.
+   */
+  markTurnStarted(): void
 }
 
 export type SessionSpawnOpts = {

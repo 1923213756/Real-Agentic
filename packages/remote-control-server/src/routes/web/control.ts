@@ -309,15 +309,24 @@ app.post('/sessions/:id/control', uuidAuth, async c => {
         status,
       )
     }
-    const workerOnline =
-      storeGetSessionWorker(sessionId)?.workerStatus === 'online'
-    if (!workerOnline) {
-      // Deferred: no control_request is in flight (no online worker to answer
-      // one), so there is no operation to await. Clear the operation id set by
-      // setDesiredSessionModel so model_state derives to 'deferred'
-      // ("下一次启动生效") instead of a permanent 'applying' ("切换中") that never
-      // resolves — the desired selection is still applied by the next worker
-      // spawn, which reconciles fine with a null operation id.
+    // A live child applies set_session_model immediately (setMainLoopModelOverride
+    // in print.ts), even between turns. Only offline/stopping/absent means there
+    // is genuinely no worker to answer — every other state (online, idle,
+    // running, working, busy, requires_action) is a connected child. Treating
+    // only 'online' as live silently deferred switches to a "next launch" that
+    // never comes while an idle-but-alive child keeps using the old model.
+    const workerStatus = storeGetSessionWorker(sessionId)?.workerStatus
+    const workerLive =
+      workerStatus !== undefined &&
+      workerStatus !== 'offline' &&
+      workerStatus !== 'stopping'
+    if (!workerLive) {
+      // Deferred: no live worker to answer a control_request, so there is no
+      // operation to await. Clear the operation id set by setDesiredSessionModel
+      // so model_state derives to 'deferred' ("下一次启动生效") instead of a
+      // permanent 'applying' ("切换中") that never resolves — the desired
+      // selection is still applied by the next worker spawn, which reconciles
+      // fine with a null operation id.
       storeUpdateSession(sessionId, { modelOperationId: null })
       return c.json(
         {

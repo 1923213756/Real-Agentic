@@ -47,7 +47,14 @@ export function resolveStackConfig(
   const connectHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host
   const localBaseUrl = `http://${connectHost}:${port}`
   const bridgeBaseUrl = env.CLAUDE_BRIDGE_BASE_URL || localBaseUrl
-  const workerCapacity = env.CLAUDE_BRIDGE_MAX_SESSIONS || '4'
+  // Resident-child cap. Idle children above it are evicted rather than
+  // blocking new sessions, so this sizes a warm-process cache, not the number
+  // of conversations the worker can serve. Keep in step with the fallback in
+  // scripts/rcs-worker.ts — this value is always injected, so it wins.
+  const workerCapacity =
+    env.CLAUDE_BRIDGE_MAX_RESIDENT || env.CLAUDE_BRIDGE_MAX_SESSIONS || '16'
+  /** Concurrent-turn cap: the CPU and model-API bound. */
+  const workerBusyCapacity = env.CLAUDE_BRIDGE_MAX_BUSY || '8'
   const webUrl =
     mode === 'dev' ? 'http://127.0.0.1:5173/code/' : `${localBaseUrl}/code/`
 
@@ -68,6 +75,7 @@ export function resolveStackConfig(
       CLAUDE_BRIDGE_BASE_URL: bridgeBaseUrl,
       CLAUDE_BRIDGE_OAUTH_TOKEN: apiKeys[0]!,
       CLAUDE_BRIDGE_MAX_SESSIONS: workerCapacity,
+      CLAUDE_BRIDGE_MAX_BUSY: workerBusyCapacity,
       CLAUDE_BRIDGE_SPAWN_MODE: env.CLAUDE_BRIDGE_SPAWN_MODE || 'same-dir',
       CLAUDE_BRIDGE_CREATE_SESSION_ON_START: '0',
       CLAUDE_BRIDGE_SESSION_INGRESS_URL:

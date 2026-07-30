@@ -43,6 +43,11 @@ import {
 import { formatDuration } from './bridgeStatusUtil.js'
 import { createBridgeLogger } from './bridgeUI.js'
 import { createCapacityWake } from './capacityWake.js'
+import {
+  admitSession,
+  hasAdmissibleSlot,
+  type ResidentSession,
+} from './capacityPolicy.js'
 import { describeAxiosError } from './debugUtils.js'
 import { createTokenRefreshScheduler } from './jwtUtils.js'
 import { getPollIntervalConfig } from './pollConfig.js'
@@ -240,6 +245,11 @@ export async function runBridgeLoop(
   // Track sessions killed by the timeout watchdog so onSessionDone can
   // distinguish them from server-initiated or shutdown interrupts.
   const timedOutSessions = new Set<string>()
+  // Sessions retired to free a capacity slot. Same purpose as the set above:
+  // an evicted child exits via SIGTERM and would otherwise be indistinguishable
+  // from a server-initiated interrupt, which suppresses the stopWork that parks
+  // the session as resumable.
+  const evictedSessions = new Set<string>()
   // Every session that ever had work dispatched this run (never pruned, unlike
   // activeSessions). At shutdown this tells the untouched pre-created landing
   // session (safe to archive as noise) apart from sessions someone used.
@@ -260,6 +270,35 @@ export async function runBridgeLoop(
   // Signal to wake the at-capacity sleep early when a session completes,
   // so the bridge can immediately accept new work.
   const capacityWake = createCapacityWake(loopSignal)
+
+  // Two caps with distinct meanings — see BridgeConfig. maxBusy defaults to
+  // maxResident so callers that never set it keep the single-limit behaviour.
+  const maxResident = config.maxSessions
+  const maxBusy = config.maxBusySessions ?? config.maxSessions
+  /** Grace before SIGKILL when retiring a child, mirroring terminate_session. */
+  const EVICT_GRACE_MS = 1500
+
+  function residentSnapshot(): ResidentSession[] {
+    return Array.from(activeSessions, ([sessionId, handle]) => ({
+      sessionId,
+      busy: handle.busy,
+      lastActivityAt: handle.lastActivityAt,
+    }))
+  }
+
+  /**
+   * Whether a new session could start right now, counting eviction of an idle
+   * child as available room. Every at-capacity throttle reads this so they
+   * agree with the admission gate: a worker holding only idle children must
+   * keep polling for session work rather than parking on the control lane.
+   */
+  function canAdmitNewSession(): boolean {
+    return hasAdmissibleSlot({
+      residents: residentSnapshot(),
+      maxResident,
+      maxBusy,
+    })
+  }
 
   /**
    * Heartbeat all active work items.
@@ -402,7 +441,7 @@ export async function runBridgeLoop(
   let fatalExit = false
 
   logForDebugging(
-    `[bridge:work] Starting poll loop spawnMode=${config.spawnMode} maxSessions=${config.maxSessions} environmentId=${environmentId}`,
+    `[bridge:work] Starting poll loop spawnMode=${config.spawnMode} maxResident=${maxResident} maxBusy=${maxBusy} environmentId=${environmentId}`,
   )
   logForDiagnosticsNoPII('info', 'bridge_loop_started', {
     max_sessions: config.maxSessions,
@@ -546,8 +585,17 @@ export async function runBridgeLoop(
       // failed session (not a server/shutdown interrupt) so we still call
       // stopWork and archiveSession below.
       const wasTimedOut = timedOutSessions.delete(sessionId)
+      // An evicted child is SIGTERM'd, so it reports 'interrupted' — the one
+      // status that skips stopWork below. Without this remap the server would
+      // leave the session 'running' until the disconnect monitor reaps it
+      // minutes later, i.e. eviction would trade a warm slot for a zombie.
+      const wasEvicted = evictedSessions.delete(sessionId)
       const status: SessionDoneStatus =
-        wasTimedOut && rawStatus === 'interrupted' ? 'failed' : rawStatus
+        rawStatus === 'interrupted' && (wasTimedOut || wasEvicted)
+          ? wasTimedOut
+            ? 'failed'
+            : 'completed'
+          : rawStatus
       const durationMs = Date.now() - startTime
 
       logForDebugging(
@@ -576,7 +624,13 @@ export async function runBridgeLoop(
 
       switch (status) {
         case 'completed':
-          logger.logSessionComplete(sessionId, durationMs)
+          if (wasEvicted) {
+            logger.logVerbose(
+              `Session ${sessionId} hibernated to free a worker slot`,
+            )
+          } else {
+            logger.logSessionComplete(sessionId, durationMs)
+          }
           break
         case 'failed':
           // Skip failure log during shutdown — the child exits non-zero when
@@ -654,7 +708,9 @@ export async function runBridgeLoop(
       // loop so the bridge exits cleanly.
       if (status !== 'interrupted' && !loopSignal.aborted) {
         if (config.spawnMode !== 'single-session') {
-          if (archiveSessionsOnLifecycle) {
+          // Never archive an evicted session: it was retired to reclaim memory
+          // and must stay in the list, ready to respawn on the next message.
+          if (archiveSessionsOnLifecycle && !wasEvicted) {
             // Cloud: archive the completed session so it doesn't linger as
             // stale in the web UI. archiveSession is idempotent (409 if already
             // archived), so double-archiving at shutdown is safe.
@@ -694,6 +750,40 @@ export async function runBridgeLoop(
     }
   }
 
+  /**
+   * Retire a resident child to reclaim its slot, mirroring the
+   * terminate_session escalation (SIGTERM, grace, SIGKILL).
+   *
+   * Safe because stopWork parks the session as idle and the next message
+   * respawns it with hydrated context — an idle child is a warm cache, not
+   * state. Returns whether the slot actually came free; a child that survives
+   * both signals leaves the work item pending for the next poll instead of
+   * letting the caller spawn into a slot that does not exist.
+   */
+  async function evictResidentSession(sessionId: string): Promise<boolean> {
+    const handle = activeSessions.get(sessionId)
+    if (!handle) return true
+    logForDebugging(
+      `[bridge:capacity] Evicting idle sessionId=${sessionId} to free a slot`,
+    )
+    evictedSessions.add(sessionId)
+    handle.kill()
+    await Promise.race([
+      handle.done,
+      sleep(EVICT_GRACE_MS, loopSignal).catch(() => undefined),
+    ])
+    if (activeSessions.has(sessionId)) {
+      handle.forceKill()
+      await Promise.race([
+        handle.done,
+        sleep(500, loopSignal).catch(() => undefined),
+      ])
+    }
+    const freed = !activeSessions.has(sessionId)
+    if (!freed) evictedSessions.delete(sessionId)
+    return freed
+  }
+
   // Start the idle status display immediately — unless we have a pre-created
   // session, in which case setAttached() already set up the display and the
   // poll loop will start status updates when it picks up the session.
@@ -711,8 +801,7 @@ export async function runBridgeLoop(
       rcLog(
         `poll: envId=${environmentId} activeSessions=${activeSessions.size}`,
       )
-      const lane =
-        activeSessions.size >= config.maxSessions ? 'control' : 'mixed'
+      const lane = canAdmitNewSession() ? 'mixed' : 'control'
       const work = await api.pollForWork(
         environmentId,
         environmentSecret,
@@ -755,7 +844,7 @@ export async function runBridgeLoop(
           continue
         }
         // Use live check (not a snapshot) since sessions can end during poll.
-        const atCap = activeSessions.size >= config.maxSessions
+        const atCap = !canAdmitNewSession()
         if (atCap) {
           const atCapMs = pollConfig.multisession_poll_interval_ms_at_capacity
           // Heartbeat loops WITHOUT polling. When at-capacity polling is also
@@ -779,7 +868,7 @@ export async function runBridgeLoop(
             let hbCycles = 0
             while (
               !loopSignal.aborted &&
-              activeSessions.size >= config.maxSessions &&
+              !canAdmitNewSession() &&
               (pollDeadline === null || Date.now() < pollDeadline)
             ) {
               // Re-read config each cycle so GrowthBook updates take effect
@@ -811,7 +900,7 @@ export async function runBridgeLoop(
                 ? hbResult
                 : loopSignal.aborted
                   ? 'shutdown'
-                  : activeSessions.size < config.maxSessions
+                  : canAdmitNewSession()
                     ? 'capacity_changed'
                     : pollDeadline !== null && Date.now() >= pollDeadline
                       ? 'poll_due'
@@ -869,7 +958,7 @@ export async function runBridgeLoop(
       // token refreshes for existing sessions are processed (the case
       // 'session' handler checks for existing sessions before the inner
       // capacity guard).
-      const atCapacityBeforeSwitch = activeSessions.size >= config.maxSessions
+      const atCapacityBeforeSwitch = !canAdmitNewSession()
 
       // Skip work items that have already been completed and stopped.
       // The server may re-deliver stale work before processing our stop
@@ -1074,6 +1163,10 @@ export async function runBridgeLoop(
           // re-dispatches work for an existing session after the WS drops.
           const existingHandle = activeSessions.get(sessionId)
           if (existingHandle) {
+            // Work was dispatched for this child, so a turn is starting. Mark
+            // it before the child echoes the replayed user message, or a
+            // concurrent admission could pick it as the idle LRU victim.
+            existingHandle.markTurnStarted()
             existingHandle.updateAccessToken(secret.session_ingress_token)
             sessionIngressTokens.set(sessionId, secret.session_ingress_token)
             sessionWorkIds.set(sessionId, work.id)
@@ -1087,14 +1180,33 @@ export async function runBridgeLoop(
             break
           }
 
-          // At capacity — token refresh for existing sessions is handled
-          // above, but we cannot spawn new ones. The post-switch capacity
-          // sleep will throttle the loop; just break here.
-          if (activeSessions.size >= config.maxSessions) {
+          // Capacity gate. Reuse is already handled above (existingHandle), so
+          // this only ever decides between spawning, evicting an idle child to
+          // make room, and leaving the work item pending. Breaking without an
+          // ack is deliberate — see the ackWork comment above; the post-switch
+          // capacity sleep throttles the retry.
+          const decision = admitSession({
+            sessionId,
+            residents: residentSnapshot(),
+            maxResident,
+            maxBusy,
+          })
+          if (decision.action === 'queue') {
             logForDebugging(
-              `[bridge:work] At capacity (${activeSessions.size}/${config.maxSessions}), cannot spawn new session for workId=${work.id}`,
+              `[bridge:work] No slot (${decision.reason}; resident=${activeSessions.size}/${maxResident}), leaving workId=${work.id} queued`,
             )
             break
+          }
+          if (decision.action === 'evict') {
+            // Single-session mode couples the bridge lifetime to its one
+            // session, so retiring it would tear down the environment.
+            if (config.spawnMode === 'single-session') break
+            if (!(await evictResidentSession(decision.sessionId))) {
+              logForDebugging(
+                `[bridge:work] Eviction of sessionId=${decision.sessionId} did not free a slot, leaving workId=${work.id} queued`,
+              )
+              break
+            }
           }
 
           let providerRuntime:
@@ -3413,7 +3525,10 @@ export type HeadlessBridgeOpts = {
   dir: string
   name?: string
   spawnMode: 'same-dir' | 'worktree'
+  /** Resident child cap (memory bound). */
   capacity: number
+  /** Concurrent-turn cap (CPU / API bound). Defaults to `capacity`. */
+  busyCapacity?: number
   permissionMode?: string
   sandbox: boolean
   sessionTimeoutMs?: number
@@ -3526,6 +3641,7 @@ export async function runBridgeHeadless(
     branch,
     gitRepoUrl,
     maxSessions: opts.capacity,
+    maxBusySessions: opts.busyCapacity,
     spawnMode: opts.spawnMode,
     verbose: false,
     sandbox: opts.sandbox,
