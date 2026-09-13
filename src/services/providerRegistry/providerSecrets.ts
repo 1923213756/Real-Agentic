@@ -156,14 +156,23 @@ export function readProviderSecret(
  * process was launched with). The active provider — the one being started or
  * switched to — always wins its slot, so activation resolves against its key
  * even if a sibling provider shares the same env var.
+ *
+ * `activeCredentialEnvName` fences off the active provider's own slot: several
+ * providers share a canonical slot (every api-key `anthropic` provider reads
+ * ANTHROPIC_API_KEY), so without it a sibling's key silently stands in for a
+ * provider that has none. The request then goes out with a credential that
+ * belongs to a different service and comes back 401, which reads as "my key is
+ * wrong" instead of "I never saved a key" — and the verification probe records
+ * `invalid` rather than `authentication_required`.
  */
 export function hydrateProviderSecretsIntoEnv(
   env: Record<string, string | undefined> = process.env,
-  options: { activeProviderId?: string } = {},
+  options: { activeProviderId?: string; activeCredentialEnvName?: string } = {},
 ): void {
   const { secrets } = readSecretsFile()
   for (const [providerId, secret] of Object.entries(secrets)) {
     if (providerId === options.activeProviderId) continue
+    if (secret.envName === options.activeCredentialEnvName) continue
     if (!env[secret.envName]) env[secret.envName] = secret.value
   }
   const active = options.activeProviderId

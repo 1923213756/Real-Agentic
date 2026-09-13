@@ -14,6 +14,7 @@ import { buildCliLaunch, spawnCli } from '../../utils/cliLaunch.js';
 import type { ToolUseContext } from '../../Tool.js';
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../../types/command.js';
 import { errorMessage } from '../../utils/errors.js';
+import { registerManagedChildProcess, terminateProcessTree } from '../../utils/processTermination.js';
 
 type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -107,18 +108,21 @@ function ServerManagementDialog({ onDone }: Props): React.ReactNode {
   const logPreview = daemonLogs.slice(-5);
 
   function handleStop(): void {
-    stopDaemon();
-    onDone('Remote Control Worker stopped.', { display: 'system' });
+    void stopDaemon().then(() => {
+      onDone('Remote Control Worker stopped.', { display: 'system' });
+    });
   }
 
   function handleRestart(): void {
-    stopDaemon();
-    try {
-      startDaemon();
-      onDone('Remote Control Worker restarted.', { display: 'system' });
-    } catch (err) {
-      onDone(`Failed to restart: ${errorMessage(err)}`, { display: 'system' });
-    }
+    void (async () => {
+      await stopDaemon();
+      try {
+        startDaemon();
+        onDone('Remote Control Worker restarted.', { display: 'system' });
+      } catch (err) {
+        onDone(`Failed to restart: ${errorMessage(err)}`, { display: 'system' });
+      }
+    })();
   }
 
   function handleContinue(): void {
@@ -212,6 +216,7 @@ function startDaemon(): void {
   });
 
   daemonProcess = child;
+  registerManagedChildProcess(child, { label: 'remote-control-daemon' });
   daemonLogs = [];
 
   child.stdout?.on('data', (data: Buffer) => {
@@ -235,14 +240,18 @@ function startDaemon(): void {
   });
 
   child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
-    daemonProcess = null;
-    daemonStatus = 'stopped';
+    if (daemonProcess === child) {
+      daemonProcess = null;
+      daemonStatus = 'stopped';
+    }
     daemonLogs.push(`[daemon] exited (code=${code ?? 'unknown'}, signal=${signal})`);
   });
 
   child.on('error', (err: Error) => {
-    daemonProcess = null;
-    daemonStatus = 'error';
+    if (daemonProcess === child) {
+      daemonProcess = null;
+      daemonStatus = 'error';
+    }
     daemonLogs.push(`[daemon] error: ${err.message}`);
   });
 }
@@ -250,23 +259,22 @@ function startDaemon(): void {
 /**
  * Stop the daemon supervisor.
  */
-function stopDaemon(): void {
-  if (daemonProcess && !daemonProcess.killed) {
-    daemonProcess.kill('SIGTERM');
-    // Force kill after 10s grace
-    const pid = daemonProcess.pid;
-    setTimeout(() => {
-      try {
-        if (pid) process.kill(pid, 0); // Check if still alive
-        if (daemonProcess && !daemonProcess.killed) {
-          daemonProcess.kill('SIGKILL');
-        }
-      } catch {
-        // Process already gone
-      }
-    }, 10_000);
-  }
+async function stopDaemon(): Promise<void> {
+  const child = daemonProcess;
+  if (!child || child.killed || !child.pid) return;
+
+  // Clear only this generation. Its delayed exit event must not overwrite a
+  // replacement started by the Restart action.
   daemonProcess = null;
+  await terminateProcessTree({
+    pid: child.pid,
+    processGroup: false,
+    steps: [
+      { signal: 'SIGTERM', waitMs: 10_000 },
+      { signal: 'SIGKILL', waitMs: 1_000 },
+    ],
+    label: 'remote-control-daemon',
+  });
   daemonStatus = 'stopped';
 }
 

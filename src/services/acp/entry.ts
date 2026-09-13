@@ -4,6 +4,8 @@ import { Readable, Writable } from 'node:stream'
 import { AcpAgent } from './agent.js'
 import { enableConfigs } from '../../utils/config.js'
 import { applySafeConfigEnvironmentVariables } from '../../utils/managedEnv.js'
+import { startParentProcessWatch } from '../../utils/parentProcessWatch.js'
+import { forceKillManagedProcessesSync } from '../../utils/processTermination.js'
 
 /**
  * Creates an ACP Stream from a pair of Node.js streams.
@@ -47,16 +49,22 @@ export async function runAcpAgent(): Promise<void> {
   console.warn = console.error
   console.debug = console.error
 
-  async function shutdown(): Promise<void> {
-    // Clean up all active sessions
-    for (const [sessionId] of agent.sessions) {
-      try {
-        await agent.unstable_closeSession({ sessionId })
-      } catch {
-        // Best-effort cleanup
+  let shutdownPromise: Promise<void> | null = null
+  function shutdown(): Promise<void> {
+    if (shutdownPromise) return shutdownPromise
+    shutdownPromise = (async () => {
+      // Clean up all active sessions
+      for (const [sessionId] of agent?.sessions ?? []) {
+        try {
+          await agent.unstable_closeSession({ sessionId })
+        } catch {
+          // Best-effort cleanup
+        }
       }
-    }
-    process.exit(0)
+      forceKillManagedProcessesSync()
+      process.exit(0)
+    })()
+    return shutdownPromise
   }
 
   // Exit cleanly when the ACP connection closes
@@ -64,6 +72,9 @@ export async function runAcpAgent(): Promise<void> {
 
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
+  if (process.platform !== 'win32') process.on('SIGHUP', shutdown)
+  startParentProcessWatch(() => void shutdown())
+  process.once('exit', forceKillManagedProcessesSync)
 
   process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason)

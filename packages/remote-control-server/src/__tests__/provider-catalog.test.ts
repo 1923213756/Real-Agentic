@@ -62,6 +62,44 @@ describe('environment provider catalog', () => {
     })
   })
 
+  test('carries the detected marker through to the browser', () => {
+    // parseProvider is an allowlist: an unrecognized key drops the whole
+    // provider and the catalog degrades to unsupported. The marker therefore
+    // has to be parsed here, not merely emitted by the runner.
+    const value = capability()
+    value.providers[0] = { ...value.providers[0]!, detected: true } as never
+
+    const result = readEnvironmentProviderCatalog({
+      provider_model_catalog_v1: value,
+    })
+
+    expect(result.supported).toBe(true)
+    expect(
+      result.supported ? result.catalog.providers[0]?.detected : undefined,
+    ).toBe(true)
+  })
+
+  test('omits the detected marker for catalog-backed providers', () => {
+    const result = readEnvironmentProviderCatalog({
+      provider_model_catalog_v1: capability(),
+    })
+
+    expect(result.supported).toBe(true)
+    expect(
+      result.supported ? result.catalog.providers[0]?.detected : 'unset',
+    ).toBeUndefined()
+  })
+
+  test('rejects a non-boolean detected marker', () => {
+    const value = capability()
+    value.providers[0] = { ...value.providers[0]!, detected: 'yes' } as never
+
+    expect(
+      readEnvironmentProviderCatalog({ provider_model_catalog_v1: value })
+        .supported,
+    ).toBe(false)
+  })
+
   test('treats missing, old, and secret-bearing capabilities as unsupported', () => {
     expect(readEnvironmentProviderCatalog(null)).toEqual({
       supported: false,

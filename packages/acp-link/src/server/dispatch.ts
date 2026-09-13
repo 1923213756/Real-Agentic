@@ -38,7 +38,7 @@ export async function dispatchClientMessage(
       await handleConnect(ws)
       break
     case 'disconnect':
-      handleDisconnect(ws)
+      await handleDisconnect(ws)
       break
     case 'new_session':
       await handleNewSession(ws, data.payload)

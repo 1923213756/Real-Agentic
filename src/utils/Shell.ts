@@ -344,6 +344,8 @@ export async function exec(
       commandTimeout,
       taskOutput,
       shouldAutoBackground,
+      undefined,
+      process.platform !== 'win32' && provider.detached,
     )
 
     // Close our copy of the fd — the child has its own dup.

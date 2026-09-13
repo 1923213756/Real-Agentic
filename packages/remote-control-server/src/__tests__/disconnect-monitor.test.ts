@@ -32,7 +32,9 @@ import {
   storeCreateWorkItem,
   storeUpdateWorkItem,
   storeGetWorkItem,
+  storeUpsertSessionWorker,
 } from '../store'
+import { getPersistence } from '../persistence/runtime'
 import {
   getEventBus,
   getAllEventBuses,
@@ -140,6 +142,7 @@ describe('Disconnect Monitor Logic', () => {
       secret: 's',
     })
     storeUpdateWorkItem(work.id, { state: 'dispatched' })
+    storeUpsertSessionWorker(session.id, { workerStatus: 'online' })
     const epochBefore = storeGetSession(session.id)!.workerEpoch
 
     const rec = storeGetSession(session.id)!
@@ -150,6 +153,16 @@ describe('Disconnect Monitor Logic', () => {
     expect(storeGetWorkItem(work.id)?.state).toBe('completed')
     expect(storeGetSession(session.id)!.workerEpoch).toBe(epochBefore + 1)
     expect(storeGetSessionWorker(session.id)?.workerStatus).toBe('offline')
+    expect(
+      getPersistence()
+        .listPendingEnvironmentCommands(env.id)
+        .some(
+          command =>
+            command.kind === 'terminate_session' &&
+            (command.payload as Record<string, unknown>).sessionId ===
+              session.id,
+        ),
+    ).toBe(true)
   })
 
   test('leaves a pending (never-taken) work item dispatchable when reaping', () => {

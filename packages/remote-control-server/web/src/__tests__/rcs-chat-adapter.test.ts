@@ -78,6 +78,7 @@ function createHarness(
   onRuntimeChange?: (runtime: SessionRuntimeState) => void,
   onPermissionRequest?: (permission: PendingPermission) => void,
   onSessionTitle?: (title: string) => void,
+  onError?: (error: string) => void,
 ) {
   let entries: ThreadEntry[] = []
   const setEntries = ((action: SetStateAction<ThreadEntry[]>) => {
@@ -87,6 +88,7 @@ function createHarness(
     onRuntimeChange,
     onPermissionRequest,
     onSessionTitle,
+    onError,
   })
   return { adapter, getEntries: () => entries }
 }
@@ -158,6 +160,50 @@ describe('RCSChatAdapter lifecycle', () => {
     })
 
     expect(titles).toEqual(['Fix login flow'])
+  })
+
+  test('surfaces a persisted session startup failure from its raw payload', async () => {
+    const errors: string[] = []
+    const failure: SessionEvent = {
+      id: 'session-start-failed-1',
+      sessionId: 'session-1',
+      type: 'session_start_failed',
+      payload: {
+        raw: {
+          code: 'session_early_exit',
+          message: "Cannot find module 'src/bootstrap/state.js'",
+          retryable: true,
+        },
+      },
+      direction: 'inbound',
+      seqNum: 1,
+      createdAt: 1_700_000_000_001,
+    }
+    globalThis.fetch = (async (input: RequestInfo | URL) =>
+      jsonResponse(
+        String(input).includes('/history')
+          ? {
+              events: [failure],
+              next_cursor: 1,
+              has_more: false,
+              oldest_available_seq: 1,
+              truncated: false,
+            }
+          : {},
+      )) as typeof fetch
+    const harness = createHarness(
+      'session-1',
+      undefined,
+      undefined,
+      undefined,
+      error => errors.push(error),
+    )
+
+    await harness.adapter.init()
+
+    expect(errors).toEqual([
+      "session_early_exit: Cannot find module 'src/bootstrap/state.js'",
+    ])
   })
 
   test('disconnecting an older adapter cannot close a newer adapter source', async () => {

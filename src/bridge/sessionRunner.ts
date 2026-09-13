@@ -5,7 +5,12 @@ import { dirname, join } from 'path'
 import { createInterface } from 'readline'
 import { jsonParse, jsonStringify } from '../utils/slowOperations.js'
 import { debugTruncate } from './debugUtils.js'
-import { validateSessionLaunchSpec } from '../utils/cliLaunch.js'
+import {
+  ensureSessionLaunchSpecRuntimeFiles,
+  validateSessionLaunchSpec,
+} from '../utils/cliLaunch.js'
+import { clearedProviderEnvironment } from '../services/providerRuntime/resolveSnapshot.js'
+import { registerManagedChildProcess } from '../utils/processTermination.js'
 import type {
   SessionActivity,
   SessionDoneStatus,
@@ -340,6 +345,8 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
             projectRoot: dir,
           }
 
+      ensureSessionLaunchSpecRuntimeFiles(launchSpec)
+
       const args = [
         ...launchSpec.scriptArgs,
         '--print',
@@ -371,7 +378,25 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
 
       const env: NodeJS.ProcessEnv = {
         ...deps.env,
+        // A spread cannot delete a key, so the provider projection's *omitted*
+        // slots would silently keep the parent worker's value — leaking the
+        // previously active provider's ANTHROPIC_AUTH_TOKEN / OPENAI_* into
+        // this session, where they can outrank the provider's own credential.
+        // Turn those omissions into explicit undefined first.
+        ...(opts.providerEnvironment
+          ? clearedProviderEnvironment(opts.providerEnvironment)
+          : {}),
         ...opts.providerEnvironment,
+        // The catalog owns inference routing for this session. Without this
+        // flag the child re-applies ~/.claude/settings.json over its spawn env
+        // (managedEnv.applyConfigEnvironmentVariables uses Object.assign), so a
+        // stale ANTHROPIC_BASE_URL / OPENAI_* there silently redirects the
+        // request to a different provider than the one the panel selected —
+        // while the Worker-side verification probe still tests the real one.
+        // The panel then shows a model that the conversation never used.
+        ...(opts.providerEnvironment
+          ? { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1' }
+          : {}),
         ...(opts.modelSelection && {
           CLAUDE_CODE_PROVIDER_ID: opts.modelSelection.providerId,
           CLAUDE_CODE_MODEL_PROFILE_ID: opts.modelSelection.modelProfileId,
@@ -409,6 +434,9 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
         CLAUDE_CODE_WORKER_EPOCH: opts.useCcrV2
           ? String(opts.workerEpoch)
           : undefined,
+        // If a Bridge Worker is killed without running its finally block, the
+        // session starts its own graceful shutdown and reaps MCP/shell helpers.
+        CLAUDE_CODE_MANAGED_PARENT_PID: String(process.pid),
       }
 
       deps.onDebug(
@@ -436,6 +464,12 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
           detached: process.platform !== 'win32',
         },
       )
+      if (!deps.spawnProcess) {
+        registerManagedChildProcess(child, {
+          processGroup: process.platform !== 'win32',
+          label: `bridge-session-${opts.sessionId}`,
+        })
+      }
 
       deps.onDebug(
         `[bridge:session] sessionId=${opts.sessionId} pid=${child.pid}`,

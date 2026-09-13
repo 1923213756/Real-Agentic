@@ -1,6 +1,7 @@
 import type { StackConfig } from './config.js'
 import { join } from 'node:path'
 import { needsProductionWebBuild } from './config.js'
+import { STACK_FORCE_KILL_REAP_GRACE_MS } from './shutdown-policy.js'
 
 export type ChildName = 'web-build' | 'rcs' | 'web' | 'worker'
 
@@ -61,7 +62,7 @@ export async function runStack(
     env: Record<string, string | undefined>,
   ): ManagedChild => {
     const child = dependencies.spawn({ name, argv, cwd, env })
-    if (name !== 'web-build') managed.push(child)
+    managed.push(child)
     return child
   }
 
@@ -75,7 +76,26 @@ export async function runStack(
         rcsPackageDir,
         {},
       )
-      const buildExit = await build.exited
+      const buildOutcome = await Promise.race([
+        build.exited.then(exit => ({ kind: 'exit' as const, exit })),
+        dependencies.signal.then(signal => ({
+          kind: 'signal' as const,
+          signal,
+        })),
+      ])
+      if (buildOutcome.kind === 'signal') {
+        await terminateChildren(managed, dependencies)
+        return {
+          reason: 'signal',
+          exitCode:
+            buildOutcome.signal === 'SIGINT'
+              ? 130
+              : buildOutcome.signal === 'SIGHUP'
+                ? 129
+                : 143,
+        }
+      }
+      const buildExit = buildOutcome.exit
       if (buildExit.code !== 0) {
         dependencies.log(`[stack] Web build failed (${buildExit.code})`)
         return { reason: 'startup-failure', exitCode: buildExit.code || 1 }
@@ -138,20 +158,27 @@ export async function runStack(
         kind: 'signal' as const,
         signal,
       })),
-      ...managed.map(child =>
-        child.exited.then(exit => ({
-          kind: 'child' as const,
-          child,
-          exit,
-        })),
-      ),
+      ...managed
+        .filter(child => child.exit === null)
+        .map(child =>
+          child.exited.then(exit => ({
+            kind: 'child' as const,
+            child,
+            exit,
+          })),
+        ),
     ])
     await terminateChildren(managed, dependencies)
 
     if (outcome.kind === 'signal') {
       return {
         reason: 'signal',
-        exitCode: outcome.signal === 'SIGINT' ? 130 : 143,
+        exitCode:
+          outcome.signal === 'SIGINT'
+            ? 130
+            : outcome.signal === 'SIGHUP'
+              ? 129
+              : 143,
       }
     }
     dependencies.log(
@@ -219,13 +246,21 @@ async function terminateChildren(
       Promise.all(group.map(child => child.exited)),
       dependencies.delay(dependencies.shutdownGraceMs),
     ])
+    const forceKilled: ManagedChild[] = []
     for (const child of group) {
       if (child.exit !== null) continue
       try {
+        forceKilled.push(child)
         child.kill('SIGKILL')
       } catch {
         // The child may have exited during the grace period.
       }
+    }
+    if (forceKilled.length > 0) {
+      await Promise.race([
+        Promise.all(forceKilled.map(child => child.exited)),
+        dependencies.delay(STACK_FORCE_KILL_REAP_GRACE_MS),
+      ])
     }
   }
 }

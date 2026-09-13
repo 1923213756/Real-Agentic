@@ -215,7 +215,11 @@ export const init = memoize(async (): Promise<void> => {
     setShellIfWindows()
 
     // Register LSP manager cleanup (initialization happens in main.tsx after --plugin-dir is processed)
-    registerCleanup(shutdownLspServerManager)
+    registerCleanup(shutdownLspServerManager, {
+      name: 'lsp-server-manager',
+      phase: 'terminate',
+      timeoutMs: 3_000,
+    })
 
     // gh-32730: teams created by subagents (or main agent without
     // explicit TeamDelete) were left on disk forever. Register cleanup

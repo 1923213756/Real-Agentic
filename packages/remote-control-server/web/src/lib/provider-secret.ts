@@ -99,6 +99,14 @@ export async function encryptProviderSecret(
   if (cleartext.byteLength < 1 || cleartext.byteLength > 16 * 1024) {
     throw new Error('invalid_provider_secret')
   }
+  // WebCrypto only exists in a secure context. Reaching the panel over plain
+  // http on a LAN address or tunnel leaves crypto.subtle undefined, and the
+  // raw TypeError that follows says nothing about the real fix.
+  if (!globalThis.crypto?.subtle) {
+    throw new Error(
+      '当前页面不是安全上下文，浏览器禁用了加密接口。请通过 http://127.0.0.1 或 https 访问控制台',
+    )
+  }
   const pair = await crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
     true,

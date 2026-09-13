@@ -223,9 +223,17 @@ export async function spawnShellTask(
   const { taskOutput } = shellCommand;
   const taskId = taskOutput.taskId;
 
-  const unregisterCleanup = registerCleanup(async () => {
-    killTask(taskId, setAppState);
-  });
+  const unregisterCleanup = registerCleanup(
+    async () => {
+      await shellCommand.kill();
+      killTask(taskId, setAppState);
+    },
+    {
+      name: `shell-task-${taskId}`,
+      phase: 'terminate',
+      timeoutMs: 2_000,
+    },
+  );
 
   const taskState: LocalShellTaskState = {
     ...createTaskStateBase(taskId, 'local_bash', description, toolUseId),
@@ -306,9 +314,17 @@ export function registerForeground(
 
   const taskId = shellCommand.taskOutput.taskId;
 
-  const unregisterCleanup = registerCleanup(async () => {
-    killTask(taskId, setAppState);
-  });
+  const unregisterCleanup = registerCleanup(
+    async () => {
+      await shellCommand.kill();
+      killTask(taskId, setAppState);
+    },
+    {
+      name: `shell-task-${taskId}`,
+      phase: 'terminate',
+      timeoutMs: 2_000,
+    },
+  );
 
   const taskState: LocalShellTaskState = {
     ...createTaskStateBase(taskId, 'local_bash', description, toolUseId),

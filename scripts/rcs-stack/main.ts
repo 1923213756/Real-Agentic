@@ -1,6 +1,11 @@
 #!/usr/bin/env bun
 import { resolve } from 'node:path'
 import { resolveStackConfig, type StackMode } from './config.js'
+import { STACK_CHILD_SHUTDOWN_GRACE_MS } from './shutdown-policy.js'
+import {
+  forceKillManagedProcessesSync,
+  registerManagedProcess,
+} from '../../src/utils/processTermination.js'
 import {
   runStack,
   type ChildExit,
@@ -17,8 +22,22 @@ function parseMode(value: string | undefined): StackMode {
 
 function signalPromise(): Promise<NodeJS.Signals> {
   return new Promise(resolveSignal => {
-    process.once('SIGINT', () => resolveSignal('SIGINT'))
-    process.once('SIGTERM', () => resolveSignal('SIGTERM'))
+    let received = false
+    const receive = (signal: NodeJS.Signals): void => {
+      if (received) {
+        forceKillManagedProcessesSync()
+        process.exit(
+          signal === 'SIGINT' ? 130 : signal === 'SIGHUP' ? 129 : 143,
+        )
+      }
+      received = true
+      resolveSignal(signal)
+    }
+    process.on('SIGINT', () => receive('SIGINT'))
+    process.on('SIGTERM', () => receive('SIGTERM'))
+    if (process.platform !== 'win32') {
+      process.on('SIGHUP', () => receive('SIGHUP'))
+    }
   })
 }
 
@@ -45,16 +64,28 @@ async function forwardLines(
 function spawnManaged(request: SpawnRequest): ManagedChild {
   const child = Bun.spawn(request.argv, {
     cwd: request.cwd,
-    env: { ...process.env, ...request.env },
+    env: {
+      ...process.env,
+      ...request.env,
+      RCS_STACK_PARENT_PID: String(process.pid),
+    },
     stdin: 'inherit',
     stdout: 'pipe',
     stderr: 'pipe',
+    // Keep terminal SIGINT/SIGTERM on the supervisor. It then drains the
+    // Worker (and its detached sessions) before stopping the control plane.
+    detached: process.platform !== 'win32',
+  })
+  const unregisterManaged = registerManagedProcess(child.pid, {
+    processGroup: process.platform !== 'win32',
+    label: `rcs-stack-${request.name}`,
   })
   let exit: ChildExit | null = null
   const prefix = request.name === 'web-build' ? 'web' : request.name
   void forwardLines(child.stdout, prefix, line => console.log(line))
   void forwardLines(child.stderr, prefix, line => console.error(line))
   const exited = child.exited.then(code => {
+    unregisterManaged()
     exit = { code, signal: null }
     return exit
   })
@@ -65,6 +96,14 @@ function spawnManaged(request: SpawnRequest): ManagedChild {
       return exit
     },
     kill(signal) {
+      if (process.platform !== 'win32') {
+        try {
+          process.kill(-child.pid, signal)
+          return
+        } catch {
+          // Fall through if the child exited or did not become group leader.
+        }
+      }
       child.kill(signal)
     },
   }
@@ -115,10 +154,12 @@ async function main(): Promise<void> {
     log: message => console.error(message),
     healthTimeoutMs: 15_000,
     healthPollMs: 200,
-    shutdownGraceMs: 5_000,
+    shutdownGraceMs: STACK_CHILD_SHUTDOWN_GRACE_MS,
   })
   process.exitCode = result.exitCode
 }
+
+process.once('exit', forceKillManagedProcessesSync)
 
 try {
   await main()

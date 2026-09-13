@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn, type SpawnOptions } from 'child_process'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { createHash } from 'crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import * as path from 'path'
 import { isInBundledMode, isRunningWithBun } from './bundledMode.js'
@@ -102,60 +103,107 @@ const IS_WINDOWS = process.platform === 'win32'
 
 type JsonRecord = Record<string, unknown>
 
-let sourceTsconfigOverride: string | null | undefined
+const sourceTsconfigOverrides = new Map<string, string>()
+
+function materializeSourceTsconfigOverride(
+  projectRoot: string,
+  overridePath: string,
+): void {
+  const configPath = path.join(projectRoot, 'tsconfig.json')
+  const sourceConfig = JSON.parse(
+    readFileSync(configPath, 'utf8'),
+  ) as JsonRecord
+  const sourceCompilerOptions =
+    sourceConfig.compilerOptions &&
+    typeof sourceConfig.compilerOptions === 'object' &&
+    !Array.isArray(sourceConfig.compilerOptions)
+      ? (sourceConfig.compilerOptions as JsonRecord)
+      : {}
+  const sourcePaths =
+    sourceCompilerOptions.paths &&
+    typeof sourceCompilerOptions.paths === 'object' &&
+    !Array.isArray(sourceCompilerOptions.paths)
+      ? (sourceCompilerOptions.paths as JsonRecord)
+      : {}
+  const absolutePaths: Record<string, string[]> = {}
+  for (const [alias, targets] of Object.entries(sourcePaths)) {
+    if (!Array.isArray(targets)) continue
+    const absoluteTargets = targets
+      .filter((target): target is string => typeof target === 'string')
+      .map(target => path.resolve(projectRoot, target))
+    if (absoluteTargets.length > 0) absolutePaths[alias] = absoluteTargets
+  }
+
+  mkdirSync(path.dirname(overridePath), { recursive: true })
+  writeFileSync(
+    overridePath,
+    JSON.stringify({
+      compilerOptions: {
+        ...sourceCompilerOptions,
+        baseUrl: projectRoot,
+        paths: absolutePaths,
+      },
+    }),
+    { encoding: 'utf8', mode: 0o600 },
+  )
+}
 
 function getSourceTsconfigOverride(projectRoot: string): string | undefined {
-  if (sourceTsconfigOverride !== undefined) {
-    return sourceTsconfigOverride ?? undefined
-  }
+  const root = path.resolve(projectRoot)
+  const cached = sourceTsconfigOverrides.get(root)
+  if (cached && existsSync(cached)) return cached
 
   try {
-    const configPath = path.join(projectRoot, 'tsconfig.json')
-    const sourceConfig = JSON.parse(
-      readFileSync(configPath, 'utf8'),
-    ) as JsonRecord
-    const sourceCompilerOptions =
-      sourceConfig.compilerOptions &&
-      typeof sourceConfig.compilerOptions === 'object' &&
-      !Array.isArray(sourceConfig.compilerOptions)
-        ? (sourceConfig.compilerOptions as JsonRecord)
-        : {}
-    const sourcePaths =
-      sourceCompilerOptions.paths &&
-      typeof sourceCompilerOptions.paths === 'object' &&
-      !Array.isArray(sourceCompilerOptions.paths)
-        ? (sourceCompilerOptions.paths as JsonRecord)
-        : {}
-    const absolutePaths: Record<string, string[]> = {}
-    for (const [alias, targets] of Object.entries(sourcePaths)) {
-      if (!Array.isArray(targets)) continue
-      const absoluteTargets = targets
-        .filter((target): target is string => typeof target === 'string')
-        .map(target => path.resolve(projectRoot, target))
-      if (absoluteTargets.length > 0) absolutePaths[alias] = absoluteTargets
-    }
-
-    const overridePath = path.join(
-      tmpdir(),
-      `claude-code-source-tsconfig-${process.pid}.json`,
-    )
-    writeFileSync(
-      overridePath,
-      JSON.stringify({
-        compilerOptions: {
-          ...sourceCompilerOptions,
-          baseUrl: projectRoot,
-          paths: absolutePaths,
-        },
-      }),
-      { encoding: 'utf8', mode: 0o600 },
-    )
-    sourceTsconfigOverride = overridePath
+    const projectKey = createHash('sha256')
+      .update(root)
+      .digest('hex')
+      .slice(0, 12)
+    const overridePath =
+      cached ??
+      path.join(
+        tmpdir(),
+        `claude-code-source-tsconfig-${process.pid}-${projectKey}.json`,
+      )
+    materializeSourceTsconfigOverride(root, overridePath)
+    sourceTsconfigOverrides.set(root, overridePath)
     return overridePath
   } catch {
-    sourceTsconfigOverride = null
+    sourceTsconfigOverrides.delete(root)
     return undefined
   }
+}
+
+/**
+ * Refresh ephemeral files referenced by a Session launch contract.
+ *
+ * RCS workers can outlive the operating system's temp-file retention window.
+ * Rewriting the source tsconfig immediately before every spawn prevents a
+ * long-lived worker from passing a deleted --tsconfig-override path to Bun.
+ * It also picks up path-alias changes without requiring a worker restart.
+ */
+export function ensureSessionLaunchSpecRuntimeFiles(
+  spec: SessionLaunchSpec,
+): void {
+  if (spec.target !== 'source-cli') return
+
+  let overridePath: string | undefined
+  for (let index = 0; index < spec.scriptArgs.length; index++) {
+    const argument = spec.scriptArgs[index]
+    if (argument?.startsWith('--tsconfig-override=')) {
+      overridePath = argument.slice('--tsconfig-override='.length)
+      break
+    }
+    if (argument === '--tsconfig-override') {
+      overridePath = spec.scriptArgs[index + 1]
+      break
+    }
+  }
+  if (!overridePath) return
+
+  materializeSourceTsconfigOverride(
+    path.resolve(spec.projectRoot),
+    overridePath,
+  )
 }
 
 export function buildScriptLaunchArgs(

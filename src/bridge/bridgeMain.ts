@@ -55,6 +55,7 @@ import {
   parseSessionModelSelectionPayload,
   resolveBridgeProviderRuntime,
 } from './providerRuntime.js'
+import type { ProviderRuntimeSelection } from '../services/providerRuntime/types.js'
 import { toCompatSessionId, toInfraSessionId } from './sessionIdCompat.js'
 import { createSessionSpawner, safeFilenameId } from './sessionRunner.js'
 import { shouldUseCcrV2ForSession } from './transportPolicy.js'
@@ -119,6 +120,8 @@ const DEFAULT_BACKOFF: BackoffConfig = {
 const STATUS_UPDATE_INTERVAL_MS = 1_000
 const SESSION_EARLY_EXIT_THRESHOLD_MS = 5_000
 const SPAWN_SESSIONS_DEFAULT = 32
+/** Grace before SIGKILL when retiring a child, mirroring terminate_session. */
+const SESSION_KILL_GRACE_MS = 1_500
 
 /**
  * GrowthBook gate for multi-session spawn modes (--spawn / --capacity / --create-session-in-dir).
@@ -275,8 +278,6 @@ export async function runBridgeLoop(
   // maxResident so callers that never set it keep the single-limit behaviour.
   const maxResident = config.maxSessions
   const maxBusy = config.maxBusySessions ?? config.maxSessions
-  /** Grace before SIGKILL when retiring a child, mirroring terminate_session. */
-  const EVICT_GRACE_MS = 1500
 
   function residentSnapshot(): ResidentSession[] {
     return Array.from(activeSessions, ([sessionId, handle]) => ({
@@ -770,7 +771,7 @@ export async function runBridgeLoop(
     handle.kill()
     await Promise.race([
       handle.done,
-      sleep(EVICT_GRACE_MS, loopSignal).catch(() => undefined),
+      sleep(SESSION_KILL_GRACE_MS, loopSignal).catch(() => undefined),
     ])
     if (activeSessions.has(sessionId)) {
       handle.forceKill()
@@ -1212,6 +1213,11 @@ export async function runBridgeLoop(
           let providerRuntime:
             | ReturnType<typeof resolveBridgeProviderRuntime>
             | undefined
+          // Model pin for a detected provider. Its credentials are ambient, so
+          // it gets no runtime projection — but the child still has to be told
+          // WHICH model to run, or every model under the provider collapses to
+          // the CLI's own default and the browser's choice is silently ignored.
+          let ambientSelection: ProviderRuntimeSelection | undefined
           if (work.data.model_selection !== undefined) {
             try {
               const selection = parseSessionModelSelectionPayload(
@@ -1236,8 +1242,9 @@ export async function runBridgeLoop(
                   { chatGPTAuthConfigured: hasStoredChatGPTAuth() },
                 ).some(profile => profile.id === selection.providerId)
               if (detectedMatch) {
+                ambientSelection = selection
                 logForDebugging(
-                  `[bridge:session] Selection targets detected provider ${selection.providerId}; using ambient environment for sessionId=${sessionId}`,
+                  `[bridge:session] Selection targets detected provider ${selection.providerId}; using ambient environment with model ${selection.resolvedModelId} for sessionId=${sessionId}`,
                 )
               } else {
                 providerRuntime = resolveBridgeProviderRuntime(
@@ -1599,7 +1606,10 @@ export async function runBridgeLoop(
               browserScopeId:
                 work.data.product === 'chat' ? sessionId : undefined,
               browserStateDirectory,
-              modelSelection: providerRuntime?.selection,
+              // `providerEnvironment` stays undefined for a detected provider:
+              // the pin only supplies --model, leaving the ambient credentials
+              // (stored ChatGPT OAuth, env keys) exactly as the CLI sees them.
+              modelSelection: providerRuntime?.selection ?? ambientSelection,
               providerEnvironment: providerRuntime?.providerEnvironment,
               onFirstUserMessage: text => {
                 // Server-set titles (--name, web rename) win. fetchSessionTitle
@@ -2106,6 +2116,14 @@ export async function runBridgeLoop(
       logForDebugging(`[bridge:shutdown] Force-killing stuck sessionId=${sid}`)
       handle.forceKill()
     }
+    // Confirm SIGKILL was observed before the Worker can itself exit. This is
+    // especially important for detached session process groups.
+    const forceReap = new AbortController()
+    await Promise.race([
+      Promise.allSettled([...activeSessions.values()].map(h => h.done)),
+      sleep(1_000, forceReap.signal),
+    ])
+    forceReap.abort()
 
     // Clear any remaining session timeout and refresh timers
     for (const timer of sessionTimers.values()) {
@@ -2392,7 +2410,33 @@ function onSessionTimeout(
     `Session timed out after ${formatDuration(timeoutMs)}`,
   )
   timedOutSessions.add(sessionId)
+  void retireTimedOutSession(sessionId, handle)
+}
+
+/**
+ * SIGTERM, then SIGKILL once the grace window passes — the same escalation
+ * eviction and terminate_session already use. SIGTERM alone is not enough: a
+ * child wedged in its own exit path (a spinning `process.on('exit')` handler)
+ * ignores it, so `handle.done` never resolves and the session stays in
+ * `activeSessions` forever. The next work item for it then takes the "already
+ * running" branch, which writes the user's message into the dead child's stdin
+ * and acks the work — the conversation silently never starts.
+ */
+export async function retireTimedOutSession(
+  sessionId: string,
+  handle: SessionHandle,
+): Promise<void> {
   handle.kill()
+  const exited = await Promise.race([
+    handle.done.then(() => true),
+    sleep(SESSION_KILL_GRACE_MS).then(() => false),
+  ])
+  if (exited) return
+  logForDebugging(
+    `[bridge:session] sessionId=${sessionId} survived SIGTERM after timeout, escalating to SIGKILL`,
+  )
+  handle.forceKill()
+  await Promise.race([handle.done, sleep(1_000)])
 }
 
 export type ParsedArgs = {
@@ -3368,8 +3412,13 @@ export async function bridgeMain(args: string[]): Promise<void> {
     logForDebugging('[bridge:shutdown] SIGTERM received, shutting down')
     controller.abort()
   }
+  const onSighup = (): void => {
+    logForDebugging('[bridge:shutdown] SIGHUP received, shutting down')
+    controller.abort()
+  }
   process.on('SIGINT', onSigint)
   process.on('SIGTERM', onSigterm)
+  if (process.platform !== 'win32') process.on('SIGHUP', onSighup)
 
   // Auto-create an empty session so the user has somewhere to type
   // immediately (matching /remote-control behavior). Controlled by
@@ -3477,6 +3526,7 @@ export async function bridgeMain(args: string[]): Promise<void> {
     }
     process.off('SIGINT', onSigint)
     process.off('SIGTERM', onSigterm)
+    if (process.platform !== 'win32') process.off('SIGHUP', onSighup)
     process.stdin.off('data', onStdinData)
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(false)
@@ -3532,6 +3582,8 @@ export type HeadlessBridgeOpts = {
   permissionMode?: string
   sandbox: boolean
   sessionTimeoutMs?: number
+  /** SIGTERM grace for managed Session children before SIGKILL. */
+  shutdownGraceMs?: number
   createSessionOnStart: boolean
   getAccessToken: () => string | undefined
   onAuth401: (failedToken: string) => Promise<boolean>
@@ -3578,6 +3630,26 @@ export async function runBridgeHeadless(
       `Workspace not trusted: ${dir}. Run \`claude\` in that directory first to accept the trust dialog.`,
     )
   }
+
+  // Load settings.json's `env` block into process.env, exactly as the CLI's
+  // bootstrap does. Deliberately after the trust check, matching the CLI's
+  // ordering — this applies unfiltered settings env.
+  //
+  // The headless bridge skips init.ts, so it never picked up credentials that
+  // live only in settings.json (ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY, ...).
+  // The spawned child DOES run that bootstrap and resolves them fine, which
+  // hid the gap — but the bridge validates a session's model against its OWN
+  // process.env before spawning anything (resolveProviderRuntimeSnapshot is
+  // handed `process.env`). So the preflight rejected a perfectly working
+  // provider with `authentication_required` and failed the work item
+  // non-retryably: every new conversation on an explicitly selected model died
+  // before the child that would have had the credential ever started. Sessions
+  // with no model selection skip the preflight and kept working, which made it
+  // look intermittent rather than systematic.
+  const { applyConfigEnvironmentVariables } = await import(
+    '../utils/managedEnv.js'
+  )
+  applyConfigEnvironmentVariables()
 
   if (!opts.getAccessToken()) {
     // Transient — supervisor's AuthManager may pick up a token on next cycle.
@@ -3721,7 +3793,9 @@ export async function runBridgeHeadless(
     spawner,
     logger,
     signal,
-    undefined,
+    opts.shutdownGraceMs === undefined
+      ? undefined
+      : { ...DEFAULT_BACKOFF, shutdownGraceMs: opts.shutdownGraceMs },
     initialSessionId,
     async () => opts.getAccessToken(),
   )

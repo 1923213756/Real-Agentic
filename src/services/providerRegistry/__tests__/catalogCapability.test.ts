@@ -121,6 +121,31 @@ describe('buildProviderCatalogCapability', () => {
     ).toBe(true)
   })
 
+  test('marks detection-only providers so the UI can hide catalog writes', () => {
+    // A detected provider has no providers.json entry, so discover / validate /
+    // delete / set-default all resolve to `provider_not_found`. Publishing the
+    // distinction is what lets the UI offer only operations that can succeed
+    // instead of rendering controls that must 404.
+    const capability = buildProviderCatalogCapability(
+      configuration(),
+      detectedProfiles(),
+    )
+    const detectedOnly = capability.providers.find(
+      provider => provider.id === 'detected-bedrock',
+    )
+    expect(detectedOnly?.detected).toBe(true)
+
+    // Providers that DO live in providers.json stay writable, including the one
+    // that merely absorbed detected auth status.
+    for (const id of ['custom-openai', 'archived-provider']) {
+      const fileProvider = capability.providers.find(
+        provider => provider.id === id,
+      )
+      expect(fileProvider).toBeDefined()
+      expect(fileProvider?.detected).toBeUndefined()
+    }
+  })
+
   test('never exposes credential values or unknown auth fields', () => {
     const detected = detectedProfiles()
     Object.assign(detected[0].auth, {

@@ -25,7 +25,11 @@ class FakeChild implements ManagedChild {
   readonly killCalls: NodeJS.Signals[] = []
   exit: ChildExit | null = null
 
-  constructor(readonly name: SpawnRequest['name']) {}
+  constructor(
+    readonly name: SpawnRequest['name'],
+    private readonly ignoreTerm = false,
+    private readonly onKill?: (signal: NodeJS.Signals) => void,
+  ) {}
 
   finish(code: number, signal: NodeJS.Signals | null = null): void {
     if (this.exit) return
@@ -35,6 +39,8 @@ class FakeChild implements ManagedChild {
 
   kill(signal: NodeJS.Signals): void {
     this.killCalls.push(signal)
+    this.onKill?.(signal)
+    if (signal === 'SIGTERM' && this.ignoreTerm) return
     this.finish(signal === 'SIGKILL' ? 137 : 0, signal)
   }
 }
@@ -44,12 +50,16 @@ function createDependencies(options: {
   healthResults: boolean[]
   workerExitCode?: number
   healthTimeoutMs?: number
+  stubbornChildren?: SpawnRequest['name'][]
 }): {
   dependencies: StackDependencies
   events: string[]
+  killOrder: string[]
   children: Partial<Record<SpawnRequest['name'], FakeChild>>
+  sendSignal: (value: NodeJS.Signals) => void
 } {
   const events: string[] = []
+  const killOrder: string[] = []
   const children: Partial<Record<SpawnRequest['name'], FakeChild>> = {}
   const signal = deferred<NodeJS.Signals>()
   let now = 0
@@ -60,7 +70,11 @@ function createDependencies(options: {
     distExists: async () => options.distExists,
     spawn(request) {
       events.push(`spawn:${request.name}`)
-      const child = new FakeChild(request.name)
+      const child = new FakeChild(
+        request.name,
+        options.stubbornChildren?.includes(request.name),
+        childSignal => killOrder.push(`${request.name}:${childSignal}`),
+      )
       children[request.name] = child
       if (request.name === 'web-build') child.finish(0)
       if (request.name === 'worker' && options.workerExitCode !== undefined) {
@@ -82,7 +96,13 @@ function createDependencies(options: {
     healthPollMs: 10,
     shutdownGraceMs: 10,
   }
-  return { dependencies, events, children }
+  return {
+    dependencies,
+    events,
+    killOrder,
+    children,
+    sendSignal: signal.resolve,
+  }
 }
 
 describe('runStack', () => {
@@ -146,5 +166,26 @@ describe('runStack', () => {
       'spawn:worker',
     ])
     expect(harness.children.web?.killCalls).toEqual(['SIGTERM'])
+  })
+
+  test('force-kills a stuck Worker before stopping RCS', async () => {
+    const config = resolveStackConfig('local', {}, () => 'secret')
+    const harness = createDependencies({
+      distExists: true,
+      healthResults: [true],
+      stubbornChildren: ['worker'],
+    })
+
+    const running = runStack(config, harness.dependencies)
+    while (!harness.children.worker) await Promise.resolve()
+    harness.sendSignal('SIGINT')
+
+    expect(await running).toEqual({ reason: 'signal', exitCode: 130 })
+    expect(harness.children.worker.killCalls).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(harness.killOrder).toEqual([
+      'worker:SIGTERM',
+      'worker:SIGKILL',
+      'rcs:SIGTERM',
+    ])
   })
 })

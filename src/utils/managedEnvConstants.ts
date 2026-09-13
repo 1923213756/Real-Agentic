@@ -18,11 +18,15 @@
 const PROVIDER_MANAGED_ENV_VARS = new Set([
   // The flag itself — settings can't unset it once the host set it
   'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
-  // Provider selection
+  // Provider selection — must list every CLAUDE_CODE_USE_* flag. OPENAI and
+  // GROK were missing, so a host that selected one of those providers could
+  // still be flipped onto a different one by the user's settings.json.
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
   'CLAUDE_CODE_USE_GEMINI',
+  'CLAUDE_CODE_USE_OPENAI',
+  'CLAUDE_CODE_USE_GROK',
   // Endpoint config (base URLs, project/resource identifiers)
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_BEDROCK_BASE_URL',
@@ -75,6 +79,17 @@ const PROVIDER_MANAGED_ENV_VARS = new Set([
   'OPENAI_DEFAULT_SONNET_MODEL_NAME',
   'OPENAI_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
   'OPENAI_SMALL_FAST_MODEL',
+  // Grok provider specific — the host projects these (they are in
+  // PROVIDER_ENVIRONMENT_KEYS), so settings must not be able to reinstate a
+  // stale endpoint, key or model over the host's choice.
+  'GROK_BASE_URL',
+  'GROK_API_KEY',
+  'XAI_API_KEY',
+  'GROK_MODEL',
+  'GROK_MODEL_MAP',
+  'GROK_DEFAULT_HAIKU_MODEL',
+  'GROK_DEFAULT_SONNET_MODEL',
+  'GROK_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_SMALL_FAST_MODEL',
   'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION',
   'CLAUDE_CODE_SUBAGENT_MODEL',

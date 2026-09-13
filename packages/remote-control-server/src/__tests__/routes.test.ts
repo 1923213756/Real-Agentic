@@ -430,7 +430,93 @@ describe('Web Provider Routes', () => {
       value: { configured: true },
     })
   })
+
+  test('dispatches the secret submit even though it repeats the handshake operation id', async () => {
+    // The submit deliberately reuses the begin's operation_id — the Worker
+    // resolves the one-time challenge by it. runEnvironmentCommand treats a
+    // known operationId as an idempotent replay, so queueing the submit under
+    // that same id returned the begin's cached result and never dispatched the
+    // envelope: the browser was told "saved" while no credential was stored.
+    const capabilities = providerCatalogCapabilities('model-a')
+    capabilities.provider_model_catalog_v1.features.catalogWrite = true
+    capabilities.provider_model_catalog_v1.features.secretControl = true
+    const environment = storeCreateEnvironment({
+      secret: 'provider-secret-replay',
+      accountId: 'web:provider-replay-owner',
+      capabilities,
+    })
+    const operationId = '77777777-7777-4777-8777-777777777777'
+
+    const beginPromise = createApp().request(
+      `/web/environments/${environment.id}/providers/custom-openai/auth/secret/begin?uuid=provider-replay-owner`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operation_id: operationId, method: 'api-key' }),
+      },
+    )
+    const beginCommand = await waitForPendingCommand(environment.id)
+    expect(beginCommand?.payload).toMatchObject({ operationId })
+    completeEnvironmentCommand({
+      commandId: beginCommand!.id,
+      environmentId: environment.id,
+      result: {
+        kind: 'begin_provider_secret',
+        ok: true,
+        value: { operationId, algorithm: 'P256-HKDF-SHA256-AESGCM' },
+        catalog: capabilities.provider_model_catalog_v1,
+      },
+    })
+    expect((await beginPromise).status).toBe(200)
+
+    const submitPromise = createApp().request(
+      `/web/environments/${environment.id}/providers/custom-openai/auth/secret?uuid=provider-replay-owner`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          operation_id: operationId,
+          method: 'api-key',
+          envelope: {
+            algorithm: 'P256-HKDF-SHA256-AESGCM',
+            browser_public_key: 'browser-public-key',
+            iv: 'encrypted-iv',
+            ciphertext: 'encrypted-credential',
+          },
+        }),
+      },
+    )
+    const submitCommand = await waitForPendingCommand(environment.id)
+    // A brand new command must be queued, carrying the relay handle.
+    expect(submitCommand).toBeDefined()
+    expect(submitCommand!.id).not.toBe(beginCommand!.id)
+    expect(submitCommand!.payload).toMatchObject({ operationId })
+    expect((submitCommand!.payload as Record<string, unknown>).action).toMatch(
+      /^relay_/,
+    )
+    completeEnvironmentCommand({
+      commandId: submitCommand!.id,
+      environmentId: environment.id,
+      result: {
+        kind: 'begin_provider_secret',
+        ok: true,
+        value: { configured: true },
+        catalog: capabilities.provider_model_catalog_v1,
+      },
+    })
+    expect((await submitPromise).status).toBe(200)
+  })
 })
+
+async function waitForPendingCommand(environmentId: string) {
+  let command =
+    getPersistence().listPendingEnvironmentCommands(environmentId)[0]
+  for (let attempt = 0; !command && attempt < 50; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 1))
+    command = getPersistence().listPendingEnvironmentCommands(environmentId)[0]
+  }
+  return command
+}
 
 const AUTH_HEADERS = {
   Authorization: 'Bearer test-api-key',
@@ -2898,6 +2984,66 @@ describe('Web Control Routes', () => {
     const body = await resJson(res)
     expect(body.status).toBe('ok')
     expect(body.event).toBeTruthy()
+  })
+
+  test('POST /web/sessions/:id/events — rejects malformed control characters before persistence', async () => {
+    const seqBefore = getPersistence().getLastSeq(sessionId)
+    const res = await app.request(
+      `/web/sessions/${sessionId}/events?uuid=user-1`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'user',
+          content: `hello\u0000world`,
+          message: { content: `hello\u0000world` },
+        }),
+      },
+    )
+
+    expect(res.status).toBe(400)
+    expect((await resJson(res)).error.type).toBe('invalid_message')
+    expect(getPersistence().getLastSeq(sessionId)).toBe(seqBefore)
+  })
+
+  test('POST /web/sessions/:id/events — rejects oversized text before persistence', async () => {
+    const seqBefore = getPersistence().getLastSeq(sessionId)
+    const content = 'x'.repeat(256 * 1024 + 1)
+    const res = await app.request(
+      `/web/sessions/${sessionId}/events?uuid=user-1`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'user',
+          content,
+          message: { content },
+        }),
+      },
+    )
+
+    expect(res.status).toBe(400)
+    expect((await resJson(res)).error.type).toBe('message_too_large')
+    expect(getPersistence().getLastSeq(sessionId)).toBe(seqBefore)
+  })
+
+  test('POST /web/sessions/:id/events — caps the request body before JSON parsing', async () => {
+    const seqBefore = getPersistence().getLastSeq(sessionId)
+    const res = await app.request(
+      `/web/sessions/${sessionId}/events?uuid=user-1`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(4 * 1024 * 1024 + 1),
+        },
+        body: JSON.stringify({ type: 'user', content: 'not parsed' }),
+      },
+    )
+
+    expect(res.status).toBe(413)
+    expect((await resJson(res)).error.type).toBe('message_too_large')
+    expect(getPersistence().getLastSeq(sessionId)).toBe(seqBefore)
   })
 
   test('POST /web/sessions/:id/events — idempotent body UUID retries return the canonical event and conflicts return 409', async () => {

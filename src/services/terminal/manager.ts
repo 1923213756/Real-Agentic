@@ -131,6 +131,9 @@ type ManagedTerminal = {
   hasOscIntegration: boolean
   fgCommand?: string
   fgCommandPromptSeq: number
+  /** Terminal.run 发出的命令级完成标记。 */
+  commandCompletions: Map<string, number>
+  activeCommandToken?: string
   lastActivityAt: number
   alive: boolean
   exitCode?: number
@@ -139,10 +142,34 @@ type ManagedTerminal = {
   exitListeners: Set<() => void>
 }
 
-// OSC 133 序列：\x1b]133;A\x07（提示符开始）/ \x1b]133;D;<code>\x07（命令结束）
+// OSC 133 序列：\x1b]133;A\x07（提示符开始）/ \x1b]133;D;<code>\x07（命令结束）。
+// Terminal.run 额外发送 D;<code>;CCB=<token>，使 SSH/嵌套 shell 中也能
+// 精确识别当前命令完成，而不是依赖外层 shell 的提示符集成。
 // 控制字符是终端转义序列的必要组成，故抑制 lint。
 // biome-ignore lint/suspicious/noControlCharactersInRegex: OSC 133 terminal escape sequences require raw control chars
-const OSC_RE = /\x1b\]133;(A|D(?:;(\d+))?)(?:\x07|\x1b\\)/g
+const OSC_RE = /\x1b\]133;(A|D(?:;(\d+))?(?:;CCB=([a-f0-9]+))?)(?:\x07|\x1b\\)/g
+
+const MAX_COMMAND_COMPLETIONS = 32
+
+function wrapCommandWithCompletionMarker(
+  command: string,
+  token: string,
+): string {
+  // 标记必须与原命令处在同一个已解析的 compound command 中。若把标记
+  // 另起一条命令排进 PTY，ssh 等前台交互程序可能先把它当成密码/输入读走。
+  // brace group 不创建子 shell，因此 cd/export 等状态变更仍会保留。
+  const marker = `printf '\\033]133;D;%s;CCB=${token}\\007' "$?"`
+  if (!command.includes('\n') && !/[;&|]\s*$/.test(command)) {
+    return `{ ${command}; ${marker}; }`
+  }
+  return [
+    '{',
+    command,
+    '__ccb_terminal_status=$?',
+    `printf '\\033]133;D;%s;CCB=${token}\\007' "$__ccb_terminal_status"`,
+    '}',
+  ].join('\n')
+}
 
 function writeShellIntegrationFiles(dir: string): void {
   mkdirSync(dir, { recursive: true })
@@ -268,6 +295,7 @@ export class TerminalManager {
       promptSeq: 0,
       hasOscIntegration: false,
       fgCommandPromptSeq: 0,
+      commandCompletions: new Map(),
       lastActivityAt: Date.now(),
       alive: true,
       cursors: new Map(),
@@ -301,14 +329,34 @@ export class TerminalManager {
     OSC_RE.lastIndex = 0
     let m = OSC_RE.exec(scan)
     let lastMatchEnd = 0
+    let stateChanged = false
     while (m) {
       if (m[1] === 'A') {
         term.promptSeq += 1
         term.hasOscIntegration = true
       } else if (m[1]?.startsWith('D')) {
         const code = m[2]
-        if (code !== undefined) term.lastCmdExitCode = Number(code)
-        term.hasOscIntegration = true
+        const commandToken = m[3]
+        if (code !== undefined) {
+          const exitCode = Number(code)
+          term.lastCmdExitCode = exitCode
+          if (commandToken) {
+            term.commandCompletions.set(commandToken, exitCode)
+            while (term.commandCompletions.size > MAX_COMMAND_COMPLETIONS) {
+              const oldest = term.commandCompletions.keys().next().value
+              if (oldest === undefined) break
+              term.commandCompletions.delete(oldest)
+            }
+            if (term.activeCommandToken === commandToken) {
+              term.activeCommandToken = undefined
+              term.fgCommand = undefined
+              stateChanged = true
+            }
+          }
+        }
+        // 命令级标记只证明 wrapper 已运行，不证明当前交互 shell 安装了
+        // prompt 集成；SSH 远端和嵌套 shell 正是这两种状态会分离的场景。
+        if (!commandToken) term.hasOscIntegration = true
       }
       lastMatchEnd = m.index + m[0].length
       m = OSC_RE.exec(scan)
@@ -319,6 +367,7 @@ export class TerminalManager {
 
     appendBuffer(term.plain, toPlainText(data), MAX_PLAIN_BUFFER)
     for (const l of term.outputListeners) l()
+    if (stateChanged) this.emit({ kind: 'state' })
     this.emit({ kind: 'output', termId: term.id, data })
   }
 
@@ -385,18 +434,17 @@ export class TerminalManager {
     this.emit({ kind: 'state' })
   }
 
-  close(ref: string): void {
+  async close(ref: string): Promise<void> {
     const term = this.mustFind(ref)
-    term.pty.kill()
     this.terminals.delete(term.id)
     this.emit({ kind: 'state' })
+    await term.pty.kill()
   }
 
-  closeAll(): void {
-    for (const term of this.terminals.values()) {
-      term.pty.kill()
-    }
+  async closeAll(): Promise<void> {
+    const terminals = [...this.terminals.values()]
     this.terminals.clear()
+    await Promise.allSettled(terminals.map(term => term.pty.kill()))
   }
 
   /** 增量读取（每个 consumer 独立游标），返回纯文本 */
@@ -429,7 +477,11 @@ export class TerminalManager {
     ref: string,
     spec: WaitSpec,
     consumer: string,
-    options: { startOffset?: number; startPromptSeq?: number } = {},
+    options: {
+      startOffset?: number
+      startPromptSeq?: number
+      completionToken?: string
+    } = {},
   ): Promise<WaitResult> {
     const term = this.mustFind(ref)
     const startedAt = Date.now()
@@ -439,6 +491,7 @@ export class TerminalManager {
       term.cursors.get(consumer) ??
       bufferTotal(term.plain)
     const silenceMs = spec.silenceMs ?? DEFAULT_SILENCE_MS
+    const completionToken = options.completionToken
     const pattern =
       spec.until === 'pattern' && spec.pattern
         ? new RegExp(spec.pattern, 'm')
@@ -450,16 +503,25 @@ export class TerminalManager {
     const finish = (outcome: WaitOutcome, matched?: string): WaitResult => {
       const output = bufferSlice(term.plain, startOffset)
       term.cursors.set(consumer, bufferTotal(term.plain))
-      return {
+      const commandExitCode = completionToken
+        ? term.commandCompletions.get(completionToken)
+        : term.lastCmdExitCode
+      const result: WaitResult = {
         outcome,
         matched,
         output,
         durationMs: Date.now() - startedAt,
-        exitCode: term.lastCmdExitCode,
-        stillRunning: term.hasOscIntegration
-          ? term.alive && term.promptSeq <= term.fgCommandPromptSeq
-          : undefined,
+        exitCode: commandExitCode,
+        stillRunning: completionToken
+          ? term.alive && commandExitCode === undefined
+          : term.hasOscIntegration
+            ? term.alive && term.promptSeq <= term.fgCommandPromptSeq
+            : undefined,
       }
+      if (completionToken && commandExitCode !== undefined) {
+        term.commandCompletions.delete(completionToken)
+      }
+      return result
     }
 
     return new Promise<WaitResult>(resolve => {
@@ -488,6 +550,12 @@ export class TerminalManager {
 
       const check = () => {
         if (spec.until === 'prompt') {
+          // Terminal.run 使用当前命令的唯一标记。这里不能再接受通用的
+          // promptSeq，否则上一条命令迟到的提示符会误完成下一条命令。
+          if (completionToken) {
+            if (term.commandCompletions.has(completionToken)) settle('prompt')
+            return
+          }
           if (term.promptSeq > startPromptSeq) {
             settle('prompt')
             return
@@ -568,15 +636,27 @@ export class TerminalManager {
     // 空隙里就跑完并打出下一个提示符，事后采样会把该提示符计入基线，
     // wait('prompt') 便只能等满超时（输出其实早已返回）。
     const startPromptSeq = term.promptSeq
+    const completionToken =
+      spec.until === 'prompt'
+        ? randomUUID().replaceAll('-', '').slice(0, 12)
+        : undefined
     term.fgCommand = command
     term.fgCommandPromptSeq = startPromptSeq
-    term.pty.write(`${command}\r`)
+    term.activeCommandToken = completionToken
+    const input = completionToken
+      ? wrapCommandWithCompletionMarker(command, completionToken)
+      : command
+    term.pty.write(`${input}\r`)
     // Bun's FileSink flush is asynchronous. Under CPU load, starting a
     // silence timer before the command reaches the PTY can report completion
     // after seeing only the input echo. Keep the pre-write offset above, but
     // do not begin waiting until the input pipe has actually been flushed.
     await term.pty.flush()
-    return this.wait(ref, spec, consumer, { startOffset, startPromptSeq })
+    return this.wait(ref, spec, consumer, {
+      startOffset,
+      startPromptSeq,
+      completionToken,
+    })
   }
 }
 
@@ -585,15 +665,18 @@ let managerSingleton: TerminalManager | null = null
 export function getTerminalManager(): TerminalManager {
   if (!managerSingleton) {
     managerSingleton = new TerminalManager()
-    registerCleanup(async () => {
-      managerSingleton?.closeAll()
-    })
+    registerCleanup(
+      async () => {
+        await managerSingleton?.closeAll()
+      },
+      { name: 'terminal-manager', phase: 'terminate', timeoutMs: 3_000 },
+    )
   }
   return managerSingleton
 }
 
 /** 仅用于测试 */
 export function resetTerminalManagerForTests(): void {
-  managerSingleton?.closeAll()
+  void managerSingleton?.closeAll()
   managerSingleton = null
 }

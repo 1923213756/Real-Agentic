@@ -14,6 +14,7 @@
  */
 import { type ChildProcess, spawn } from 'child_process'
 import { registerCleanup } from '../utils/cleanupRegistry.js'
+import { registerManagedChildProcess } from '../utils/processTermination.js'
 import { logForDebugging } from '../utils/debug.js'
 
 // Caffeinate timeout in seconds. Process auto-exits after this duration.
@@ -112,9 +113,12 @@ function spawnCaffeinate(): void {
   // Register cleanup on first use to ensure caffeinate is killed on exit
   if (!cleanupRegistered) {
     cleanupRegistered = true
-    registerCleanup(async () => {
-      forceStopPreventSleep()
-    })
+    registerCleanup(
+      async () => {
+        forceStopPreventSleep()
+      },
+      { name: 'prevent-sleep', phase: 'terminate', timeoutMs: 500 },
+    )
   }
 
   try {
@@ -129,6 +133,9 @@ function spawnCaffeinate(): void {
         stdio: 'ignore',
       },
     )
+    registerManagedChildProcess(caffeinateProcess, {
+      label: 'caffeinate',
+    })
 
     // Don't let caffeinate keep the Node process alive
     caffeinateProcess.unref()

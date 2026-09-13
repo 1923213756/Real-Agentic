@@ -5,6 +5,7 @@ import type {
   ProviderModelDiscovery,
   ProviderModelCatalog,
 } from '../types'
+import { resolveProviderResponse } from './provider-pending'
 import { generateMessageUuid } from './utils'
 
 const PROVIDER_KINDS = new Set([
@@ -323,8 +324,17 @@ export class ProviderCatalogModel {
       return { ok: false, conflict: false, error: 'provider_catalog_readonly' }
     }
     try {
+      const operationId = generateMessageUuid()
+      // A write the Worker answers slower than the route's short synchronous
+      // window comes back 202 with no `stale` field. Resolve it against the
+      // durable command record before parsing, or a perfectly healthy mutation
+      // is reported as `invalid_provider_catalog_response`.
       const response = parseProviderCatalogResponse(
-        await mutation(this.state.catalog.revision, generateMessageUuid()),
+        await resolveProviderResponse(
+          this.state.environmentId ?? '',
+          operationId,
+          await mutation(this.state.catalog.revision, operationId),
+        ),
       )
       if (this.state.environmentId !== null) {
         writeCachedCatalog(this.state.environmentId, response.catalog)

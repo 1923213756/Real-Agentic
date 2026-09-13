@@ -81,6 +81,42 @@ describe('session model options', () => {
     ).toBe('model-b')
   })
 
+  test('offers detected providers so an ambient login is actually selectable', () => {
+    // A ChatGPT subscription is advertised only as `detected-chatgpt`. It was
+    // filtered out of this menu back when the bridge rejected such selections
+    // at spawn; since the bridge switched to spawning them against the ambient
+    // environment, hiding them meant the provider could be authenticated from
+    // the UI and then never used anywhere.
+    const value = catalog()
+    value.providers.push({
+      id: 'detected-chatgpt',
+      displayName: 'ChatGPT Subscription',
+      kind: 'chatgpt',
+      auth: { scheme: 'oauth', source: 'secure-storage', configured: true },
+      enabled: true,
+      archived: false,
+      detected: true,
+      models: [
+        {
+          id: 'gpt-5-6-sol',
+          displayName: 'gpt-5.6-sol',
+          remoteModelId: 'gpt-5.6-sol',
+          enabled: true,
+          archived: false,
+          validation: { status: 'unverified' },
+        },
+      ],
+    })
+
+    const options = buildSessionModelOptions(value)
+    const chatgpt = options.find(
+      option => option.providerId === 'detected-chatgpt',
+    )
+    expect(chatgpt?.label).toBe('ChatGPT Subscription / gpt-5.6-sol')
+    // The bridge pins the model from this id, so it has to survive the mapping.
+    expect(chatgpt?.remoteModelId).toBe('gpt-5.6-sol')
+  })
+
   test('does not silently replace a missing old selection with the environment default', () => {
     const options = buildSessionModelOptions(catalog())
     expect(

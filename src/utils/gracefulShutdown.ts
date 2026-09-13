@@ -40,6 +40,10 @@ import { getCurrentSessionTitle, sessionIdExists } from './sessionStorage.js'
 import { sleep } from './sleep.js'
 import { closeSentry } from './sentry.js'
 import { profileReport } from './startupProfiler.js'
+import { forceKillManagedProcessesSync } from './processTermination.js'
+import { startParentProcessWatch } from './parentProcessWatch.js'
+
+const CLEANUP_BUDGET_MS = 10_000
 
 /**
  * Clean up terminal modes synchronously before process exit.
@@ -191,6 +195,10 @@ function forceExit(exitCode: number): never {
     clearTimeout(failsafeTimer)
     failsafeTimer = undefined
   }
+  // Async cleanup may have timed out or been interrupted by a second signal.
+  // Reap every registered child synchronously before process.exit can cut off
+  // an in-flight tree enumeration or signal escalation.
+  forceKillManagedProcessesSync()
   // Drain stdin LAST, right before exit. cleanupTerminalModes() sent
   // DISABLE_MOUSE_TRACKING early, but the terminal round-trip plus any
   // events already in flight means bytes can arrive during the seconds
@@ -248,6 +256,22 @@ export const setupGracefulShutdown = memoize(() => {
   // active for Ink cleanup.
   onExit(() => {})
 
+  const requestSignalShutdown = (
+    signal: NodeJS.Signals,
+    exitCode: number,
+  ): void => {
+    logForDiagnosticsNoPII('info', 'shutdown_signal', { signal })
+    signalShutdownCount += 1
+    if (shutdownInProgress || signalShutdownCount > 1) {
+      // A second interrupt means the user explicitly requested an immediate
+      // exit. Still synchronously reap all managed process groups first.
+      cleanupTerminalModes()
+      printResumeHint()
+      forceExit(exitCode)
+    }
+    gracefulShutdownSync(exitCode)
+  }
+
   process.on('SIGINT', () => {
     // In print mode, print.ts registers its own SIGINT handler that aborts
     // the in-flight query and calls gracefulShutdown(0); skip here to
@@ -257,17 +281,14 @@ export const setupGracefulShutdown = memoize(() => {
     if (process.argv.includes('-p') || process.argv.includes('--print')) {
       return
     }
-    logForDiagnosticsNoPII('info', 'shutdown_signal', { signal: 'SIGINT' })
-    void gracefulShutdown(0)
+    requestSignalShutdown('SIGINT', 130)
   })
   process.on('SIGTERM', () => {
-    logForDiagnosticsNoPII('info', 'shutdown_signal', { signal: 'SIGTERM' })
-    void gracefulShutdown(143) // Exit code 143 (128 + 15) for SIGTERM
+    requestSignalShutdown('SIGTERM', 143)
   })
   if (process.platform !== 'win32') {
     process.on('SIGHUP', () => {
-      logForDiagnosticsNoPII('info', 'shutdown_signal', { signal: 'SIGHUP' })
-      void gracefulShutdown(129) // Exit code 129 (128 + 1) for SIGHUP
+      requestSignalShutdown('SIGHUP', 129)
     })
 
     // Detect orphaned process when terminal closes without delivering SIGHUP.
@@ -291,6 +312,13 @@ export const setupGracefulShutdown = memoize(() => {
     }
   }
 
+  stopParentProcessWatch = startParentProcessWatch(() => {
+    logForDiagnosticsNoPII('info', 'shutdown_signal', {
+      signal: 'managed_parent_exit',
+    })
+    gracefulShutdownSync(129)
+  })
+
   // Log uncaught exceptions for container observability and analytics
   // Error names (e.g., "TypeError") are not sensitive - safe to log
   process.on('uncaughtException', error => {
@@ -302,6 +330,7 @@ export const setupGracefulShutdown = memoize(() => {
       error_name:
         error.name as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     })
+    if (!shutdownInProgress) gracefulShutdownSync(1)
   })
 
   // Log unhandled promise rejections for container observability and analytics
@@ -325,7 +354,13 @@ export const setupGracefulShutdown = memoize(() => {
       error_name:
         errorName as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     })
+    if (!shutdownInProgress) gracefulShutdownSync(1)
   })
+
+  // Covers ordinary process.exit() paths that bypass gracefulShutdown. The
+  // exit event cannot await, so this deliberately uses the synchronous
+  // process registry failsafe.
+  process.once('exit', forceKillManagedProcessesSync)
 })
 
 export function gracefulShutdownSync(
@@ -354,8 +389,10 @@ export function gracefulShutdownSync(
 }
 
 let shutdownInProgress = false
+let signalShutdownCount = 0
 let failsafeTimer: ReturnType<typeof setTimeout> | undefined
 let orphanCheckInterval: ReturnType<typeof setInterval> | undefined
+let stopParentProcessWatch: (() => void) | undefined
 let pendingShutdown: Promise<void> | undefined
 
 /** Check if graceful shutdown is in progress */
@@ -366,11 +403,14 @@ export function isShuttingDown(): boolean {
 /** Reset shutdown state - only for use in tests */
 export function resetShutdownState(): void {
   shutdownInProgress = false
+  signalShutdownCount = 0
   resumeHintPrinted = false
   if (failsafeTimer !== undefined) {
     clearTimeout(failsafeTimer)
     failsafeTimer = undefined
   }
+  stopParentProcessWatch?.()
+  stopParentProcessWatch = undefined
   pendingShutdown = undefined
 }
 
@@ -382,8 +422,10 @@ export function getPendingShutdownForTesting(): Promise<void> | undefined {
   return pendingShutdown
 }
 
-// Graceful shutdown function that drains the event loop
-export async function gracefulShutdown(
+// Graceful shutdown function that drains the event loop. Every caller receives
+// the same in-flight promise so an overlapping exit path cannot return early
+// and call process.exit() while the first cleanup is still running.
+export function gracefulShutdown(
   exitCode = 0,
   reason: ExitReason = 'other',
   options?: {
@@ -393,11 +435,21 @@ export async function gracefulShutdown(
     finalMessage?: string
   },
 ): Promise<void> {
-  if (shutdownInProgress) {
-    return
-  }
+  if (pendingShutdown) return pendingShutdown
   shutdownInProgress = true
+  pendingShutdown = performGracefulShutdown(exitCode, reason, options)
+  return pendingShutdown
+}
 
+async function performGracefulShutdown(
+  exitCode: number,
+  reason: ExitReason,
+  options?: {
+    getAppState?: () => AppState
+    setAppState?: (f: (prev: AppState) => AppState) => void
+    finalMessage?: string
+  },
+): Promise<void> {
   // Resolve the SessionEnd hook budget before arming the failsafe so the
   // failsafe can scale with it. Without this, a user-configured 10s hook
   // budget is silently truncated by the 5s failsafe (gh-32712 follow-up).
@@ -408,14 +460,16 @@ export async function gracefulShutdown(
 
   // Failsafe: guarantee process exits even if cleanup hangs (e.g., MCP connections).
   // Runs cleanupTerminalModes first so a hung cleanup doesn't leave the terminal dirty.
-  // Budget = max(5s, hook budget + 3.5s headroom for cleanup + analytics flush).
+  // Budget includes the full process cleanup window, hook budget, and a small
+  // persistence/analytics margin. The final callback synchronously kills any
+  // child still registered before exiting.
   failsafeTimer = setTimeout(
     code => {
       cleanupTerminalModes()
       printResumeHint()
       forceExit(code)
     },
-    Math.max(5000, sessionEndTimeoutMs + 3500),
+    Math.max(15_000, CLEANUP_BUDGET_MS + sessionEndTimeoutMs + 2_000),
     exitCode,
   )
   failsafeTimer.unref()
@@ -435,30 +489,16 @@ export async function gracefulShutdown(
   // terminal is dead (SIGHUP, SSH disconnect), hooks and analytics may hang
   // on I/O to a dead TTY or unreachable network, eating into the
   // failsafe budget. Session persistence must complete before anything else.
-  let cleanupTimeoutId: ReturnType<typeof setTimeout> | undefined
   try {
-    const cleanupPromise = (async () => {
-      try {
-        await runCleanupFunctions()
-      } catch {
-        // Silently ignore cleanup errors
-      }
-    })()
-
-    await Promise.race([
-      cleanupPromise,
-      new Promise((_, reject) => {
-        cleanupTimeoutId = setTimeout(
-          rej => rej(new CleanupTimeoutError()),
-          2000,
-          reject,
-        )
-      }),
-    ])
-    clearTimeout(cleanupTimeoutId)
-  } catch {
-    // Silently handle timeout and other errors
-    clearTimeout(cleanupTimeoutId)
+    const report = await runCleanupFunctions({ timeoutMs: CLEANUP_BUDGET_MS })
+    for (const failure of report.failures) {
+      logForDebugging(
+        `Cleanup ${failure.name} (${failure.phase}) ${failure.reason}`,
+        { level: 'error' },
+      )
+    }
+  } catch (error) {
+    logForDebugging(`Cleanup registry failed: ${error}`, { level: 'error' })
   }
 
   // Execute SessionEnd hooks. Bound both the per-hook default timeout and the
@@ -519,10 +559,4 @@ export async function gracefulShutdown(
   }
 
   forceExit(exitCode)
-}
-
-class CleanupTimeoutError extends Error {
-  constructor() {
-    super('Cleanup timeout')
-  }
 }

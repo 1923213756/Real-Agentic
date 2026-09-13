@@ -131,7 +131,7 @@ export function handleTerminalInboundMessage(
       case 'terminal_close': {
         const termId = String(msg.term_id ?? '')
         if (termId && manager.has(termId)) {
-          manager.close(termId)
+          void manager.close(termId)
         }
         break
       }

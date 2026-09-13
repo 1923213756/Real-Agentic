@@ -142,6 +142,69 @@ describe('TerminalManager', () => {
     expect(Date.now() - started).toBeLessThan(10_000)
   }, 40000)
 
+  test('run until prompt completes inside a nested shell without OSC integration', async () => {
+    const manager = getTerminalManager()
+    manager.open({ name: 'ut-nested-prompt', cwd: '/tmp' })
+
+    // 外层 shell 有 OSC 集成，子 shell 刻意不继承。进入交互式子 shell
+    // 本身是长运行命令，短等待超时属于正常行为。
+    const entered = await manager.run(
+      'ut-nested-prompt',
+      'bash --norc',
+      { until: 'prompt', timeoutS: 1 },
+      'nested-consumer',
+    )
+    expect(entered.outcome).toBe('timeout')
+
+    const started = Date.now()
+    const result = await manager.run(
+      'ut-nested-prompt',
+      'echo NESTED_DONE && false',
+      { until: 'prompt', timeoutS: 8 },
+      'nested-consumer',
+    )
+    expect(result.outcome).toBe('prompt')
+    expect(result.output).toContain('NESTED_DONE')
+    expect(result.exitCode).toBe(1)
+    expect(result.stillRunning).toBe(false)
+    expect(manager.info('ut-nested-prompt').fgCommand).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(5_000)
+
+    manager.sendKeys('ut-nested-prompt', ['ctrl-d'])
+    manager.close('ut-nested-prompt')
+  }, 20000)
+
+  test('prompt completion wrapper preserves shell state and heredocs', async () => {
+    const manager = getTerminalManager()
+    manager.open({ name: 'ut-marker-semantics', cwd: '/tmp' })
+
+    const changed = await manager.run(
+      'ut-marker-semantics',
+      'cd / && export CCB_MARKER_STATE=kept',
+      { until: 'prompt', timeoutS: 8 },
+      'marker-consumer',
+    )
+    expect(changed.exitCode).toBe(0)
+
+    const state = await manager.run(
+      'ut-marker-semantics',
+      'printf "PWD=%s STATE=%s\\n" "$PWD" "$CCB_MARKER_STATE"',
+      { until: 'prompt', timeoutS: 8 },
+      'marker-consumer',
+    )
+    expect(state.output).toContain('PWD=/ STATE=kept')
+
+    const heredoc = await manager.run(
+      'ut-marker-semantics',
+      "cat <<'EOF'\nHEREDOC_MARKER_OK\nEOF",
+      { until: 'prompt', timeoutS: 8 },
+      'marker-consumer',
+    )
+    expect(heredoc.outcome).toBe('prompt')
+    expect(heredoc.output).toContain('HEREDOC_MARKER_OK')
+    manager.close('ut-marker-semantics')
+  }, 30000)
+
   test('close removes the terminal', () => {
     const manager = getTerminalManager()
     manager.open({ name: 'ut-close', cwd: '/tmp' })

@@ -65,6 +65,8 @@ type CatalogProvider = {
   enabled: boolean
   archived: boolean
   models: CatalogModel[]
+  /** Synthesized from ambient CLI auth; has no providers.json entry to mutate. */
+  detected?: boolean
 }
 
 export type EnvironmentProviderCatalog = {
@@ -204,8 +206,10 @@ function parseProvider(value: unknown): CatalogProvider | null {
     !hasOnlyKeys(
       provider,
       ['id', 'displayName', 'kind', 'auth', 'enabled', 'archived', 'models'],
-      ['baseUrl', 'compatRule'],
+      ['baseUrl', 'compatRule', 'detected'],
     ) ||
+    (provider['detected'] !== undefined &&
+      typeof provider['detected'] !== 'boolean') ||
     !stableId(provider['id']) ||
     !nonEmptyString(provider['displayName']) ||
     typeof provider['kind'] !== 'string' ||
@@ -251,6 +255,9 @@ function parseProvider(value: unknown): CatalogProvider | null {
     enabled: provider['enabled'],
     archived: provider['archived'],
     models: parsedModels,
+    ...(provider['detected'] === undefined
+      ? {}
+      : { detected: provider['detected'] }),
   }
 }
 

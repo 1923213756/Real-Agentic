@@ -265,7 +265,7 @@ export const TerminalTool = buildTool({
       }
 
       case 'close': {
-        manager.close(input.term)
+        await manager.close(input.term)
         return { data: { result: `Terminal "${input.term}" closed.` } }
       }
 

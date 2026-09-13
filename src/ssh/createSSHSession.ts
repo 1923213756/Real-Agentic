@@ -13,9 +13,21 @@ import { buildCliLaunch } from '../utils/cliLaunch.js'
 import { logForDebugging } from '../utils/debug.js'
 import { jsonParse } from '../utils/slowOperations.js'
 import { randomUUID } from 'crypto'
+import {
+  registerManagedProcess,
+  terminateProcessTree,
+} from '../utils/processTermination.js'
 
 const INIT_TIMEOUT_MS = 30_000
 const STDERR_TAIL_LINES = 20
+
+function trackSessionProcess(proc: Subprocess, label: string): void {
+  const unregister = registerManagedProcess(proc.pid, {
+    processGroup: process.platform !== 'win32',
+    label,
+  })
+  void proc.exited.then(unregister, unregister)
+}
 
 export interface SSHSession {
   remoteCwd: string
@@ -162,7 +174,9 @@ export async function createSSHSession(
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
+      detached: process.platform !== 'win32',
     })
+    trackSessionProcess(proc, 'ssh-session')
   } catch (err) {
     proxy.stop()
     throw new SSHSessionError(
@@ -196,7 +210,11 @@ export async function createSSHSession(
       remoteCwd = await waitForInit(proc, config.cwd || defaultCwd)
     } catch (err) {
       proxy.stop()
-      proc.kill()
+      await terminateProcessTree({
+        pid: proc.pid,
+        processGroup: process.platform !== 'win32',
+        label: 'failed-ssh-session',
+      })
       throw err
     }
   }
@@ -221,7 +239,9 @@ export async function createSSHSession(
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
+      detached: process.platform !== 'win32',
     })
+    trackSessionProcess(newProc, 'ssh-session-reconnect')
 
     const newStderrChunks: string[] = []
     collectStderr(newProc, newStderrChunks)
@@ -284,8 +304,14 @@ export async function createLocalSSHSession(config: {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...spec.env, ...authEnv },
+      env: {
+        ...spec.env,
+        ...authEnv,
+        CLAUDE_CODE_MANAGED_PARENT_PID: String(process.pid),
+      },
+      detached: process.platform !== 'win32',
     })
+    trackSessionProcess(proc, 'local-ssh-session')
   } catch (err) {
     proxy.stop()
     throw new SSHSessionError(
@@ -303,7 +329,11 @@ export async function createLocalSSHSession(config: {
     remoteCwd = await waitForInit(proc, config.cwd)
   } catch (err) {
     proxy.stop()
-    proc.kill()
+    await terminateProcessTree({
+      pid: proc.pid,
+      processGroup: process.platform !== 'win32',
+      label: 'failed-local-ssh-session',
+    })
     throw err
   }
 
@@ -323,8 +353,14 @@ export async function createLocalSSHSession(config: {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...reconnectSpec.env, ...authEnv },
+      env: {
+        ...reconnectSpec.env,
+        ...authEnv,
+        CLAUDE_CODE_MANAGED_PARENT_PID: String(process.pid),
+      },
+      detached: process.platform !== 'win32',
     })
+    trackSessionProcess(newProc, 'local-ssh-session-reconnect')
 
     const newStderrChunks: string[] = []
     collectStderr(newProc, newStderrChunks)

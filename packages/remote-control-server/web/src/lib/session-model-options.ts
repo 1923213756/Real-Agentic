@@ -17,25 +17,21 @@ export type SessionModelOption = {
 
 /**
  * Detected-only providers (env/OAuth credentials the CLI probed) are advertised
- * in the environment catalog under a `detected-*` id so the Provider Settings
- * page can offer to adopt them. They are NOT in the worker's providers.json, so
- * selecting one as a session model resolves to `model_not_found` at spawn. Keep
- * them out of the switchable menu until the user materializes a real profile.
+ * in the environment catalog under a `detected-*` id and are NOT in the
+ * worker's providers.json.
+ *
+ * They used to be filtered out here because the catalog resolver rejected them
+ * at spawn with `provider_not_found`. The bridge stopped resolving detected
+ * selections against the catalog on 2026-07-29 — it spawns them against the
+ * ambient environment and pins the model via `--model` — so excluding them now
+ * only hides a provider that works. A ChatGPT subscription could be
+ * authenticated from the UI and then never selected anywhere.
  */
-function isDetectedOnlyProvider(providerId: string): boolean {
-  return providerId.startsWith('detected-')
-}
-
 export function buildSessionModelOptions(
   catalog: ProviderModelCatalog,
 ): SessionModelOption[] {
   return catalog.providers
-    .filter(
-      provider =>
-        provider.enabled &&
-        !provider.archived &&
-        !isDetectedOnlyProvider(provider.id),
-    )
+    .filter(provider => provider.enabled && !provider.archived)
     .flatMap(provider =>
       provider.models
         .filter(

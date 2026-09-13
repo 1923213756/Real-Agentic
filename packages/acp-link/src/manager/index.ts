@@ -20,6 +20,7 @@ export async function startManager(port: number): Promise<void> {
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
+  if (process.platform !== 'win32') process.on('SIGHUP', shutdown)
 
   const server = serve({ fetch: app.fetch, port })
   server.on('error', (err: NodeJS.ErrnoException) => {

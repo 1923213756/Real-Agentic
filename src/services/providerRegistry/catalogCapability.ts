@@ -166,6 +166,9 @@ function sanitizeDetectedProvider(
     enabled: provider.enabled,
     archived: provider.archived,
     models: copyModels(provider.models),
+    // Detected profiles exist only in memory. Marking them lets the UI drop the
+    // management controls that would resolve against providers.json and 404.
+    detected: true,
   })
 }
 

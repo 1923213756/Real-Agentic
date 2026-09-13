@@ -6,6 +6,7 @@ import {
 } from '../bridge/bridgeMain.js'
 import { getClaudeAIOAuthTokens } from '../utils/auth.js'
 import { errorMessage } from '../utils/errors.js'
+import { startParentProcessWatch } from '../utils/parentProcessWatch.js'
 
 /**
  * Exit codes the supervisor uses to decide retry vs park.
@@ -74,6 +75,8 @@ async function runRemoteControlWorker(): Promise<void> {
   const onSignal = () => controller.abort()
   process.on('SIGTERM', onSignal)
   process.on('SIGINT', onSignal)
+  if (process.platform !== 'win32') process.on('SIGHUP', onSignal)
+  const stopParentWatch = startParentProcessWatch(onSignal)
 
   const opts: HeadlessBridgeOpts = {
     dir,
@@ -108,5 +111,7 @@ async function runRemoteControlWorker(): Promise<void> {
   } finally {
     process.off('SIGTERM', onSignal)
     process.off('SIGINT', onSignal)
+    if (process.platform !== 'win32') process.off('SIGHUP', onSignal)
+    stopParentWatch()
   }
 }

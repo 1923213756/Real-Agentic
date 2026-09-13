@@ -1,6 +1,7 @@
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import {
   projectRuntimeEnvironment,
+  providerCredentialEnvName,
   resolveProviderRuntimeSnapshot,
 } from '../providerRuntime/resolveSnapshot.js'
 import {
@@ -178,7 +179,13 @@ export async function probeProviderModel(
   // provider's durable secret into its slot, then resolve + project, so the
   // probe sees exactly the base URL + key a real session would.
   const probeEnv: Record<string, string | undefined> = { ...deps.baseEnv }
-  deps.hydrateSecrets(probeEnv, { activeProviderId: provider.id })
+  const credentialEnvName = providerCredentialEnvName(provider)
+  deps.hydrateSecrets(probeEnv, {
+    activeProviderId: provider.id,
+    ...(credentialEnvName === undefined
+      ? {}
+      : { activeCredentialEnvName: credentialEnvName }),
+  })
 
   let snapshot: ProviderRuntimeSnapshot
   try {
@@ -192,7 +199,11 @@ export async function probeProviderModel(
         updatedAt: Date.now(),
       },
       probeEnv,
-      { isModelAllowed: deps.isModelAllowed },
+      // The probe is what *decides* validity, so it must be able to re-check a
+      // model that a previous run stamped `invalid` — otherwise the first
+      // failure (a typo'd key, an expired plan) latches the model dead and no
+      // amount of fixing the credential can bring it back.
+      { isModelAllowed: deps.isModelAllowed, allowInvalidModel: true },
     )
   } catch (error) {
     if (error instanceof ProviderRuntimeResolutionError) {

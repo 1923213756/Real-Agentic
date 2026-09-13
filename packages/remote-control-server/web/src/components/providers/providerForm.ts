@@ -52,7 +52,23 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     kind: 'chatgpt',
     authScheme: 'oauth',
     authSource: 'secure-storage',
-    suggestedModels: ['gpt-5', 'gpt-5-codex'],
+    // Codex-with-a-ChatGPT-account only accepts the current model family and
+    // rejects retired ids outright ("The 'gpt-5' model is not supported when
+    // using Codex with a ChatGPT account", HTTP 400) — a stale suggestion here
+    // produces a provider that fails on every request. Source of truth is
+    // CHATGPT_CODEX_MODEL_OPTIONS in src/utils/model/chatgptModels.ts; the web
+    // bundle cannot import from the CLI package, so keep these in step by hand.
+    suggestedModels: [
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+      'gpt-5.4',
+      'gpt-5.4-mini',
+      'gpt-5.3-codex',
+      'gpt-5.3-codex-spark',
+      'gpt-5.2',
+    ],
   },
   {
     id: 'gemini',

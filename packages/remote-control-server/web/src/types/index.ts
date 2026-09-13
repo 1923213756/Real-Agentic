@@ -65,6 +65,13 @@ export interface ProviderCatalogProfile {
   enabled: boolean
   archived: boolean
   models: ProviderCatalogModelProfile[]
+  /**
+   * Synthesized from the runner's ambient auth (stored OAuth, settings, env
+   * vars) instead of providers.json. Catalog writes resolve against
+   * providers.json, so every management operation on a detected provider fails
+   * with `provider_not_found` — the UI must not offer them.
+   */
+  detected?: boolean
 }
 
 export interface ProviderModelCatalog {
@@ -84,6 +91,18 @@ export interface ProviderCatalogResponse {
   catalog: ProviderModelCatalog
   stale: boolean
   value?: unknown
+  /**
+   * Present instead of `value` when the write outran the server's short
+   * synchronous window and came back 202 — the command is still queued for the
+   * Worker. Poll `apiFetchProviderOperation` with it to collect the result.
+   */
+  operation_id?: string
+}
+
+export interface ProviderOperationResponse {
+  status: 'pending' | 'completed'
+  operation_id: string
+  result?: { ok?: boolean; errorCode?: string; value?: unknown }
 }
 
 export interface ProviderDiscoveredModel {

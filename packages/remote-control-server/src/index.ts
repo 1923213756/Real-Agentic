@@ -175,3 +175,6 @@ async function gracefulShutdown(signal: string) {
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+if (process.platform !== 'win32') {
+  process.on('SIGHUP', () => gracefulShutdown('SIGHUP'))
+}

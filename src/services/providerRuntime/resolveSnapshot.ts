@@ -22,7 +22,7 @@ export const API_PROVIDER_BY_KIND: Record<ProviderKind, APIProvider> = {
   foundry: 'foundry',
 }
 
-const PROVIDER_ENVIRONMENT_KEYS = [
+export const PROVIDER_ENVIRONMENT_KEYS = [
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
@@ -57,6 +57,14 @@ const PROVIDER_ENVIRONMENT_KEYS = [
 
 export type ResolveSnapshotOptions = {
   isModelAllowed?: (model: string) => boolean
+  /**
+   * Skip the `validation.status === 'invalid'` gate. Only the verification
+   * probe may set this: it is the code that *decides* the status, so refusing
+   * to resolve an already-invalid model latches it forever — a key fixed after
+   * a failed check could never be re-verified. Everything else (activation,
+   * session launch) must keep the gate.
+   */
+  allowInvalidModel?: boolean
 }
 
 /**
@@ -186,7 +194,7 @@ export function resolveProviderRuntimeSnapshot(
   if (!model.enabled || model.archived) {
     throw new ProviderRuntimeResolutionError('model_unavailable')
   }
-  if (model.validation.status === 'invalid') {
+  if (model.validation.status === 'invalid' && !options.allowInvalidModel) {
     throw new ProviderRuntimeResolutionError('invalid_model')
   }
   if (model.remoteModelId !== selection.resolvedModelId) {
@@ -232,6 +240,27 @@ export function resolveProviderRuntimeSnapshot(
       ? {}
       : { credentialTargetEnvName }),
   })
+}
+
+/**
+ * The provider slots a projected environment deliberately left empty.
+ *
+ * projectRuntimeEnvironment expresses "unset this" by *omitting* the key, which
+ * only works for callers that adopt the projection wholesale. A caller that
+ * merges it over a parent environment with spread (the child-process spawn in
+ * bridge/sessionRunner) cannot express a deletion that way — an absent key just
+ * leaves the parent's stale value in place, so the previous provider's
+ * ANTHROPIC_AUTH_TOKEN / OPENAI_BASE_URL leaks into the new provider's session
+ * and can outrank its credential. Those callers must spread this patch first.
+ */
+export function clearedProviderEnvironment(
+  projected: Readonly<Record<string, string | undefined>>,
+): Record<string, undefined> {
+  const cleared: Record<string, undefined> = {}
+  for (const key of PROVIDER_ENVIRONMENT_KEYS) {
+    if (projected[key] === undefined) cleared[key] = undefined
+  }
+  return cleared
 }
 
 /** Project a snapshot over a copy of baseEnv without mutating the caller. */

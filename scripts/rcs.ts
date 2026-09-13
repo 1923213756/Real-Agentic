@@ -18,6 +18,7 @@
  *   RCS_SINGLE_USER=0 RCS_API_KEYS=key1,key2 RCS_PORT=4000 bun run rcs
  */
 import { resolve } from 'node:path'
+import { startManagedParentWatch } from './rcs-stack/parent-watch.js'
 
 // config.ts 在模块加载时读取环境变量——开发默认值必须写在动态 import 之前，
 // 不能用静态 import（ESM 提升会让 config 先于本文件代码求值）。
@@ -33,6 +34,11 @@ if (!apiKeysFromEnv) {
 }
 
 const { config } = await import('../packages/remote-control-server/src/config')
+const stopParentWatch = startManagedParentWatch(() => {
+  console.error('[RCS] Stack supervisor exited; shutting down server')
+  process.kill(process.pid, 'SIGTERM')
+})
+process.once('exit', stopParentWatch)
 
 console.log(`[RCS] Starting Remote Control Server...`)
 console.log(`[RCS] Host: ${config.host}`)

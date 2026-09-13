@@ -4,6 +4,7 @@ import {
   saveProviderCredentialSettings,
 } from '../providerSettingsWriter.js'
 import {
+  CHATGPT_CODEX_BALANCED_MODEL,
   CHATGPT_CODEX_DEFAULT_MODEL,
   CHATGPT_CODEX_FAST_MODEL,
 } from '../../../utils/model/chatgptModels.js'
@@ -14,6 +15,8 @@ import type {
 
 function createDependencies(options?: { updateError?: Error }) {
   const updates: ProviderSettingsPatch[] = []
+  const secretWrites: { providerId: string; envName: string; value: string }[] =
+    []
   const env: Record<string, string | undefined> = {
     OPENAI_AUTH_MODE: 'chatgpt',
     CLAUDE_CODE_USE_BEDROCK: '1',
@@ -36,11 +39,16 @@ function createDependencies(options?: { updateError?: Error }) {
     removeChatGPT: async () => {
       removeChatGPTCount += 1
     },
+    // Never touch the developer's real ~/.claude/provider-secrets.json.
+    writeSecret: (providerId, envName, value) => {
+      secretWrites.push({ providerId, envName, value })
+    },
   }
   return {
     dependencies,
     updates,
     env,
+    secretWrites,
     getClearOpenAICount: () => clearOpenAICount,
     getClearGrokCount: () => clearGrokCount,
     getRemoveChatGPTCount: () => removeChatGPTCount,
@@ -162,7 +170,7 @@ describe('saveCompatibleProviderSettings', () => {
         OPENAI_API_KEY: undefined,
         OPENAI_MODEL: undefined,
         OPENAI_DEFAULT_HAIKU_MODEL: CHATGPT_CODEX_FAST_MODEL,
-        OPENAI_DEFAULT_SONNET_MODEL: CHATGPT_CODEX_DEFAULT_MODEL,
+        OPENAI_DEFAULT_SONNET_MODEL: CHATGPT_CODEX_BALANCED_MODEL,
         OPENAI_DEFAULT_OPUS_MODEL: CHATGPT_CODEX_DEFAULT_MODEL,
       },
     })
@@ -256,5 +264,14 @@ describe('saveCompatibleProviderSettings', () => {
     )
 
     expect(state.updates[0]?.env.ANTHROPIC_API_KEY).toBe('anthropic-api-key')
+    // The credential goes to the injected store, never to the real
+    // ~/.claude/provider-secrets.json this suite would otherwise pollute.
+    expect(state.secretWrites).toEqual([
+      {
+        providerId: 'anthropic-direct',
+        envName: 'ANTHROPIC_API_KEY',
+        value: 'anthropic-api-key',
+      },
+    ])
   })
 })

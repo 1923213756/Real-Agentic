@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto'
 import { getClaudeConfigHomeDir } from '../utils/envUtils.js'
 import { isProcessRunning } from '../utils/genericProcessUtils.js'
 import { jsonParse } from '../utils/slowOperations.js'
+import { terminateProcessTree } from '../utils/processTermination.js'
 import { selectEngine } from './bg/engines/index.js'
 import type { SessionEntry } from './bg/engine.js'
 
@@ -246,24 +247,27 @@ export async function killHandler(target: string | undefined): Promise<void> {
 
   console.log(`Killing session ${session.sessionId} (PID: ${session.pid})...`)
 
-  try {
-    process.kill(session.pid, 'SIGTERM')
-  } catch {
+  if (!isProcessRunning(session.pid)) {
     console.log('Session already exited.')
     return
   }
 
-  await new Promise(resolve => setTimeout(resolve, 2000))
-
-  if (isProcessRunning(session.pid)) {
-    try {
-      process.kill(session.pid, 'SIGKILL')
-      console.log('Session force-killed.')
-    } catch {
-      console.log('Session exited during grace period.')
-    }
+  const result = await terminateProcessTree({
+    pid: session.pid,
+    processGroup: resolveSessionEngine(session) === 'detached',
+    steps: [
+      { signal: 'SIGTERM', waitMs: 2_000 },
+      { signal: 'SIGKILL', waitMs: 1_000 },
+    ],
+    label: `background-session-${session.sessionId}`,
+  })
+  if (result.exited) {
+    console.log(result.forced ? 'Session force-killed.' : 'Session stopped.')
   } else {
-    console.log('Session stopped.')
+    console.error(
+      `Session did not fully exit; remaining PIDs: ${result.remainingPids.join(', ')}`,
+    )
+    process.exitCode = 1
   }
 
   const pidFile = join(getSessionsDir(), `${session.pid}.json`)

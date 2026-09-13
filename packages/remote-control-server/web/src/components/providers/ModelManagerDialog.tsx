@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { Check, LoaderCircle, Minus, Plus, RefreshCw, Search, X } from 'lucide-react';
 import { apiDiscoverProviderModels } from '../../api/client';
 import { parseProviderCatalogResponse, parseProviderModelDiscovery } from '../../lib/provider-catalog-model';
+import { resolveProviderResponse } from '../../lib/provider-pending';
 import { mergeManagedProviderModels, type ManagedProviderModel } from '../../lib/provider-model-manager';
 import type {
   ProviderCatalogModelProfile,
@@ -48,9 +49,17 @@ export function ModelManagerDialog({
     setLoading(true);
     setError(null);
     try {
+      // Discovery against a live provider routinely outruns the route's short
+      // synchronous window and returns 202; resolve that to the durable result
+      // instead of reading `value` off a pending body.
       const response = parseProviderCatalogResponse(
-        await apiDiscoverProviderModels(environmentId, providerId, nextController.signal),
+        await resolveProviderResponse(
+          environmentId,
+          null,
+          await apiDiscoverProviderModels(environmentId, providerId, nextController.signal),
+        ),
       );
+      if (nextController.signal.aborted) return;
       const next = parseProviderModelDiscovery(response.value);
       if (next.providerId !== providerId) throw new Error('invalid_model_discovery_response');
       setDiscovery(next);

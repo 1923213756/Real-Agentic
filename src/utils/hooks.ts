@@ -1111,6 +1111,7 @@ async function execCommandHook(
     child = spawn(pwshPath, buildPowerShellArgs(finalCommand), {
       env: envVars,
       cwd: safeCwd,
+      detached: process.platform !== 'win32',
       // Prevent visible console window on Windows (no-op on other platforms)
       windowsHide: true,
     }) as ChildProcessWithoutNullStreams
@@ -1122,6 +1123,7 @@ async function execCommandHook(
       env: envVars,
       cwd: safeCwd,
       shell,
+      detached: process.platform !== 'win32',
       // Prevent visible console window on Windows (no-op on other platforms)
       windowsHide: true,
     }) as ChildProcessWithoutNullStreams
@@ -1130,7 +1132,15 @@ async function execCommandHook(
   // Hooks use pipe mode — stdout must be streamed into JS so we can parse
   // the first response line to detect async hooks ({"async": true}).
   const hookTaskOutput = new TaskOutput(`hook_${child.pid}`, null)
-  const shellCommand = wrapSpawn(child, signal, hookTimeoutMs, hookTaskOutput)
+  const shellCommand = wrapSpawn(
+    child,
+    signal,
+    hookTimeoutMs,
+    hookTaskOutput,
+    false,
+    undefined,
+    process.platform !== 'win32',
+  )
   // Track whether shellCommand ownership was transferred (e.g., to async hook registry)
   let shellCommandTransferred = false
   // Track whether stdin has already been written (to avoid "write after end" errors)

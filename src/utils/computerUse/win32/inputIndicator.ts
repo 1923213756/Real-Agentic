@@ -15,6 +15,7 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
+import { registerManagedProcess } from '../../processTermination.js'
 import { validateHwnd, getTmpDir } from './shared.js'
 
 const INDICATOR_WIDTH = 350
@@ -174,6 +175,10 @@ export function showIndicator(hwnd: string): boolean {
       ],
       { stdout: 'ignore', stderr: 'ignore' },
     )
+    const unregister = registerManagedProcess(indicatorProc.pid, {
+      label: 'computer-use-input-indicator',
+    })
+    void indicatorProc.exited.then(unregister, unregister)
     return true
   } catch {
     return false
@@ -190,22 +195,26 @@ export function updateIndicator(message: string): void {
 
 /** Hide and destroy the indicator */
 export function hideIndicator(): void {
+  const proc = indicatorProc
+  const stopPath = stopFile
+  const scriptPath = scriptFile
+  const messagePath = msgFile
   if (stopFile) {
     try {
       fs.writeFileSync(stopFile, 'STOP', 'utf-8')
     } catch {}
     setTimeout(() => {
       try {
-        indicatorProc?.kill()
+        proc?.kill()
       } catch {}
       try {
-        if (scriptFile) fs.unlinkSync(scriptFile)
+        if (scriptPath) fs.unlinkSync(scriptPath)
       } catch {}
       try {
-        if (stopFile) fs.unlinkSync(stopFile)
+        if (stopPath) fs.unlinkSync(stopPath)
       } catch {}
       try {
-        if (msgFile) fs.unlinkSync(msgFile)
+        if (messagePath) fs.unlinkSync(messagePath)
       } catch {}
     }, 2000)
   }
