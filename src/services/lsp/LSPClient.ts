@@ -14,6 +14,10 @@ import type {
 import { logForDebugging } from '../../utils/debug.js'
 import { errorMessage } from '../../utils/errors.js'
 import { logError } from '../../utils/log.js'
+import {
+  registerManagedChildProcess,
+  terminateProcessTree,
+} from '../../utils/processTermination.js'
 import { subprocessEnv } from '../../utils/subprocessEnv.js'
 /**
  * LSP client interface.
@@ -60,6 +64,7 @@ export function createLSPClient(
   let startFailed = false
   let startError: Error | undefined
   let isStopping = false // Track intentional shutdown to avoid spurious error logging
+  let unregisterManagedProcess: (() => void) | undefined
   // Queue handlers registered before connection ready (lazy initialization support)
   const pendingHandlers: Array<{
     method: string
@@ -99,8 +104,14 @@ export function createLSPClient(
           stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...subprocessEnv(), ...options?.env },
           cwd: options?.cwd,
+          detached: globalThis.process.platform !== 'win32',
           // Prevent visible console window on Windows (no-op on other platforms)
           windowsHide: true,
+        })
+        unregisterManagedProcess?.()
+        unregisterManagedProcess = registerManagedChildProcess(process, {
+          processGroup: globalThis.process.platform !== 'win32',
+          label: `lsp-${serverName}`,
         })
 
         if (!process.stdout || !process.stdin) {
@@ -379,7 +390,15 @@ export function createLSPClient(
       try {
         if (connection) {
           // Try to send shutdown request and exit notification
-          await connection.sendRequest('shutdown', {})
+          await Promise.race([
+            connection.sendRequest('shutdown', {}),
+            new Promise<void>((_, reject) =>
+              setTimeout(
+                () => reject(new Error('LSP shutdown request timed out')),
+                750,
+              ),
+            ),
+          ])
           await connection.sendNotification('exit', {})
         }
       } catch (error) {
@@ -414,14 +433,25 @@ export function createLSPClient(
             process.stderr.removeAllListeners('data')
           }
 
-          try {
-            process.kill()
-          } catch (error) {
-            // Process might already be dead, which is fine
-            logForDebugging(
-              `Process kill failed for ${serverName} (may already be dead): ${errorMessage(error)}`,
-            )
+          const pid = process.pid
+          if (pid) {
+            const result = await terminateProcessTree({
+              pid,
+              processGroup: globalThis.process.platform !== 'win32',
+              steps: [
+                { signal: 'SIGTERM', waitMs: 500 },
+                { signal: 'SIGKILL', waitMs: 500 },
+              ],
+              label: `lsp-${serverName}`,
+            })
+            if (!result.exited) {
+              logForDebugging(
+                `LSP process tree ${serverName} did not fully exit: ${result.remainingPids.join(',')}`,
+              )
+            }
           }
+          unregisterManagedProcess?.()
+          unregisterManagedProcess = undefined
           process = undefined
         }
 

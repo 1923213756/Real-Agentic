@@ -1,9 +1,12 @@
 import type { ChildProcess } from 'child_process'
 import { stat } from 'fs/promises'
 import type { Readable } from 'stream'
-import treeKill from 'tree-kill'
 import { generateTaskId } from '../Task.js'
 import { formatDuration } from './format.js'
+import {
+  registerManagedChildProcess,
+  terminateProcessTree,
+} from './processTermination.js'
 import {
   MAX_TASK_OUTPUT_BYTES,
   MAX_TASK_OUTPUT_BYTES_DISPLAY,
@@ -32,7 +35,7 @@ export type ExecResult = {
 export type ShellCommand = {
   background: (backgroundTaskId: string) => boolean
   result: Promise<ExecResult>
-  kill: () => void
+  kill: () => Promise<void>
   status: 'running' | 'backgrounded' | 'completed' | 'killed'
   /**
    * Cleans up stream resources (event listeners).
@@ -130,13 +133,15 @@ class ShellCommandImpl implements ShellCommand {
   #resultResolver: ((result: ExecResult) => void) | null = null
   #exitCodeResolver: ((code: number) => void) | null = null
   #boundAbortHandler: (() => void) | null = null
+  #terminationPromise: Promise<void> | null = null
+  #processGroup: boolean
   readonly taskOutput: TaskOutput
 
   static #handleTimeout(self: ShellCommandImpl): void {
     if (self.#shouldAutoBackground && self.#onTimeoutCallback) {
       self.#onTimeoutCallback(self.background.bind(self))
     } else {
-      self.#doKill(SIGTERM)
+      void self.#doKill(SIGTERM)
     }
   }
 
@@ -152,13 +157,19 @@ class ShellCommandImpl implements ShellCommand {
     taskOutput: TaskOutput,
     shouldAutoBackground = false,
     maxOutputBytes = MAX_TASK_OUTPUT_BYTES,
+    processGroup = false,
   ) {
     this.#childProcess = childProcess
     this.#abortSignal = abortSignal
     this.#timeout = timeout
     this.#shouldAutoBackground = shouldAutoBackground
     this.#maxOutputBytes = maxOutputBytes
+    this.#processGroup = processGroup
     this.taskOutput = taskOutput
+    registerManagedChildProcess(childProcess, {
+      processGroup,
+      label: `shell-command-${childProcess.pid ?? 'unknown'}`,
+    })
 
     // In file mode (bash commands), both stdout and stderr go to the
     // output file fd — childProcess.stdout/.stderr are both null.
@@ -249,7 +260,7 @@ class ShellCommandImpl implements ShellCommand {
           ) {
             this.#killedForSize = true
             this.#clearSizeWatchdog()
-            this.#doKill(SIGKILL)
+            void this.#doKill(SIGKILL)
           }
         },
         () => {
@@ -334,16 +345,27 @@ class ShellCommandImpl implements ShellCommand {
     }
   }
 
-  #doKill(code?: number): void {
+  #doKill(code?: number): Promise<void> {
+    if (this.#terminationPromise) return this.#terminationPromise
     this.#status = 'killed'
-    if (this.#childProcess.pid) {
-      treeKill(this.#childProcess.pid, 'SIGKILL')
-    }
+    const pid = this.#childProcess.pid
+    this.#terminationPromise = pid
+      ? terminateProcessTree({
+          pid,
+          processGroup: this.#processGroup,
+          steps: [
+            { signal: 'SIGTERM', waitMs: 500 },
+            { signal: 'SIGKILL', waitMs: 1_000 },
+          ],
+          label: `shell-command-${pid}`,
+        }).then(() => {})
+      : Promise.resolve()
     this.#resolveExitCode(code ?? SIGKILL)
+    return this.#terminationPromise
   }
 
-  kill(): void {
-    this.#doKill()
+  kill(): Promise<void> {
+    return this.#doKill()
   }
 
   background(taskId: string): boolean {
@@ -391,6 +413,7 @@ export function wrapSpawn(
   taskOutput: TaskOutput,
   shouldAutoBackground = false,
   maxOutputBytes = MAX_TASK_OUTPUT_BYTES,
+  processGroup = false,
 ): ShellCommand {
   return new ShellCommandImpl(
     childProcess,
@@ -399,6 +422,7 @@ export function wrapSpawn(
     taskOutput,
     shouldAutoBackground,
     maxOutputBytes,
+    processGroup,
   )
 }
 
@@ -429,7 +453,7 @@ class AbortedShellCommand implements ShellCommand {
     return false
   }
 
-  kill(): void {}
+  async kill(): Promise<void> {}
 
   cleanup(): void {}
 }
@@ -459,7 +483,7 @@ export function createFailedCommand(preSpawnError: string): ShellCommand {
     background(): boolean {
       return false
     },
-    kill(): void {},
+    async kill(): Promise<void> {},
     cleanup(): void {},
   }
 }

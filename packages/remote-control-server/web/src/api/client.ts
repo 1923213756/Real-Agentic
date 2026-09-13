@@ -10,6 +10,7 @@ import type {
   ProviderCatalogResponse,
   ProviderMutationPayload,
   ProviderModelMutationPayload,
+  ProviderOperationResponse,
 } from '../types'
 import { generateMessageUuid } from '../lib/utils'
 
@@ -398,6 +399,17 @@ export function apiBeginProviderSecret(
     'POST',
     `/web/environments/${segment(environmentId)}/providers/${segment(providerId)}/auth/secret/begin`,
     input,
+  )
+}
+
+/** Collect the durable result of a provider write that came back 202 pending. */
+export function apiFetchProviderOperation(
+  environmentId: string,
+  operationId: string,
+) {
+  return api<ProviderOperationResponse>(
+    'GET',
+    `/web/environments/${segment(environmentId)}/provider-operations/${segment(operationId)}`,
   )
 }
 

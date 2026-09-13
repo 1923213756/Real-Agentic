@@ -7,6 +7,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import type { McpClientDependencies } from './interfaces.js'
 import type { ConnectedMCPServer, ScopedMcpServerConfig } from './types.js'
+import { terminateMcpProcessTree } from './processTermination.js'
 
 // ============================================================================
 // Constants
@@ -311,119 +312,11 @@ export async function terminateWithSignalEscalation(
   serverName: string,
 ): Promise<void> {
   try {
-    logger.debug(`[${serverName}] Sending SIGINT to MCP server process`)
-
-    try {
-      process.kill(childPid, 'SIGINT')
-    } catch (error) {
-      logger.debug(`[${serverName}] Error sending SIGINT: ${error}`)
-      return
-    }
-
-    // biome-ignore lint/suspicious/noAsyncPromiseExecutor: complex cleanup logic requires async in executor
-    await new Promise<void>(async resolve => {
-      let resolved = false
-
-      const checkInterval = setInterval(() => {
-        try {
-          process.kill(childPid, 0)
-        } catch {
-          if (!resolved) {
-            resolved = true
-            clearInterval(checkInterval)
-            clearTimeout(failsafeTimeout)
-            logger.debug(`[${serverName}] MCP server process exited cleanly`)
-            resolve()
-          }
-        }
-      }, 50)
-
-      const failsafeTimeout = setTimeout(() => {
-        if (!resolved) {
-          resolved = true
-          clearInterval(checkInterval)
-          logger.debug(
-            `[${serverName}] Cleanup timeout reached, stopping process monitoring`,
-          )
-          resolve()
-        }
-      }, 600)
-
-      try {
-        // Wait 100ms for SIGINT to work
-        await sleep(100)
-
-        if (!resolved) {
-          try {
-            process.kill(childPid, 0)
-            // Process still exists, try SIGTERM
-            logger.debug(`[${serverName}] SIGINT failed, sending SIGTERM`)
-            try {
-              process.kill(childPid, 'SIGTERM')
-            } catch (termError) {
-              logger.debug(
-                `[${serverName}] Error sending SIGTERM: ${termError}`,
-              )
-              resolved = true
-              clearInterval(checkInterval)
-              clearTimeout(failsafeTimeout)
-              resolve()
-              return
-            }
-          } catch {
-            resolved = true
-            clearInterval(checkInterval)
-            clearTimeout(failsafeTimeout)
-            resolve()
-            return
-          }
-
-          // Wait 400ms for SIGTERM
-          await sleep(400)
-
-          if (!resolved) {
-            try {
-              process.kill(childPid, 0)
-              logger.debug(`[${serverName}] SIGTERM failed, sending SIGKILL`)
-              try {
-                process.kill(childPid, 'SIGKILL')
-              } catch (killError) {
-                logger.debug(
-                  `[${serverName}] Error sending SIGKILL: ${killError}`,
-                )
-              }
-            } catch {
-              resolved = true
-              clearInterval(checkInterval)
-              clearTimeout(failsafeTimeout)
-              resolve()
-            }
-          }
-        }
-
-        if (!resolved) {
-          resolved = true
-          clearInterval(checkInterval)
-          clearTimeout(failsafeTimeout)
-          resolve()
-        }
-      } catch {
-        if (!resolved) {
-          resolved = true
-          clearInterval(checkInterval)
-          clearTimeout(failsafeTimeout)
-          resolve()
-        }
-      }
-    })
+    logger.debug(`[${serverName}] Terminating MCP server process tree`)
+    await terminateMcpProcessTree(childPid)
   } catch (processError) {
     logger.debug(`[${serverName}] Error terminating process: ${processError}`)
   }
-}
-
-/** Simple sleep utility (avoids importing from host) */
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 // ============================================================================

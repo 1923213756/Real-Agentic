@@ -39,6 +39,19 @@ export type ProviderWebCommandInput = {
   payload: Record<string, unknown>
   write?: boolean
   forceRefresh?: boolean
+  /**
+   * Queue-level operation id, defaulting to `payload.operationId`.
+   *
+   * runEnvironmentCommand treats a matching operationId as an idempotent
+   * replay and returns the earlier command's stored result without dispatching
+   * anything. The provider-secret submit must therefore NOT queue under the
+   * handshake's id: it deliberately repeats it in the payload (the Worker looks
+   * the one-time challenge up by it), so without a distinct queue id the submit
+   * was silently answered with the begin's cached result — the envelope never
+   * reached the Worker, no credential was stored, and the browser still showed
+   * "saved".
+   */
+  commandOperationId?: string
 }
 
 function readCatalog(environment: EnvironmentRecord) {
@@ -169,11 +182,12 @@ export async function runProviderWebCommand(
     }
   }
   const operationId =
-    input.write && typeof input.payload.operationId === 'string'
+    input.commandOperationId ??
+    (input.write && typeof input.payload.operationId === 'string'
       ? input.payload.operationId
       : input.write
         ? randomUUID()
-        : undefined
+        : undefined)
   try {
     const result =
       await runEnvironmentCommand<ProviderEnvironmentCommandResult>(
@@ -181,8 +195,12 @@ export async function runProviderWebCommand(
           environmentId: environment.id,
           ownerId: input.ownerId,
           kind: input.kind,
+          // A caller-supplied queue id must never leak into the payload: the
+          // Worker resolves the one-time challenge by payload.operationId, so
+          // overwriting it would turn every submit into
+          // provider_secret_operation_not_found.
           payload:
-            operationId === undefined
+            operationId === undefined || input.commandOperationId !== undefined
               ? input.payload
               : { ...input.payload, operationId },
           operationId,

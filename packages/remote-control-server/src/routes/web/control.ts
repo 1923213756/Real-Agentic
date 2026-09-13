@@ -1,5 +1,6 @@
 import { log, error as logError } from '../../logger'
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { randomUUID } from 'node:crypto'
 import { uuidAuth } from '../../auth/middleware'
 import {
@@ -23,8 +24,26 @@ import {
   LIVE_WORKER_COMMAND_TYPES,
 } from '../../transport/event-delivery-policy'
 import { storeGetSessionWorker, storeUpdateSession } from '../../store'
+import {
+  MAX_WEB_EVENT_BODY_BYTES,
+  validateUserMessagePayload,
+} from '../../services/user-message-validation'
 
 const app = new Hono()
+
+const webEventBodyLimit = bodyLimit({
+  maxSize: MAX_WEB_EVENT_BODY_BYTES,
+  onError: c =>
+    c.json(
+      {
+        error: {
+          type: 'message_too_large',
+          message: `Request body exceeds the ${MAX_WEB_EVENT_BODY_BYTES}-byte limit`,
+        },
+      },
+      413,
+    ),
+})
 
 type OwnershipCheckResult =
   | { error: true }
@@ -145,7 +164,7 @@ app.post('/sessions/:id/live-events', uuidAuth, async c => {
 })
 
 /** POST /web/sessions/:id/events — Send user message to session */
-app.post('/sessions/:id/events', uuidAuth, async c => {
+app.post('/sessions/:id/events', uuidAuth, webEventBodyLimit, async c => {
   const requestedSessionId = c.req.param('id')!
   const ownership = checkOwnership(c, requestedSessionId)
   if (ownership.error) {
@@ -166,6 +185,12 @@ app.post('/sessions/:id/events', uuidAuth, async c => {
     typeof body.type === 'string' && body.type ? body.type : 'user'
   if (!DURABLE_MESSAGE_EVENT_TYPES.has(eventType)) {
     return c.json(unsupportedEventTypeResponse(eventType), 400)
+  }
+  if (eventType === 'user') {
+    const validationError = validateUserMessagePayload(body)
+    if (validationError) {
+      return c.json({ error: validationError }, 400)
+    }
   }
   log(
     `[RC-DEBUG] web -> server: POST /web/sessions/${sessionId}/events type=${eventType}`,

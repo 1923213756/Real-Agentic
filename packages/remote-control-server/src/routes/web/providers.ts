@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import { uuidAuth } from '../../auth/middleware'
 import {
@@ -607,6 +608,10 @@ app.post(
             method: text(input.method),
             action: relayId,
           },
+          // The payload keeps the handshake's operationId (the Worker resolves
+          // the one-time challenge by it), so the submit needs its own queue id
+          // or runEnvironmentCommand replays the begin instead of dispatching.
+          commandOperationId: randomUUID(),
         }),
         200,
       )

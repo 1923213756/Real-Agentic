@@ -26,6 +26,16 @@ export type ProviderAuthOperationStatus = {
   expiresAt: number
   pollIntervalMs?: number
   errorCode?: string
+  /**
+   * Redacted, human-readable reason behind `errorCode`.
+   *
+   * `errorCode` is a small closed set the UI maps to fixed copy, so every
+   * transport-level failure collapsed into `provider_auth_failed` — a 403 from
+   * auth.openai.com (no proxy on this host) was indistinguishable from a
+   * rejected account, and the panel could only say "check your network and
+   * account". This carries the underlying message so the cause is visible.
+   */
+  errorDetail?: string
 }
 
 export type ProviderCloudRefreshRequest =

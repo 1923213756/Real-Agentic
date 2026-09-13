@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs'
 import { join, dirname } from 'path'
+import { execFileSync } from 'node:child_process'
 import { getClaudeConfigHomeDir } from '../utils/envUtils.js'
 
 /**
@@ -12,6 +13,8 @@ export interface DaemonStateData {
   startedAt: string
   workerKinds: string[]
   lastStatus: 'running' | 'stopped' | 'error'
+  /** OS process start token; prevents a stale state file killing a reused PID. */
+  processIdentity?: string
 }
 
 export type DaemonStatus = 'running' | 'stopped' | 'stale'
@@ -74,6 +77,33 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+export function getProcessIdentity(pid: number): string | undefined {
+  try {
+    if (process.platform === 'win32') {
+      return execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-Command',
+          `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`,
+        ],
+        { encoding: 'utf8', timeout: 1_000, windowsHide: true },
+      ).trim()
+    }
+    return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 1_000,
+    }).trim()
+  } catch {
+    return undefined
+  }
+}
+
+function matchesProcessIdentity(state: DaemonStateData): boolean {
+  if (!state.processIdentity) return true
+  return getProcessIdentity(state.pid) === state.processIdentity
+}
+
 /**
  * Query the daemon status by reading the state file and probing the PID.
  *
@@ -91,7 +121,7 @@ export function queryDaemonStatus(name = 'remote-control'): {
     return { status: 'stopped' }
   }
 
-  if (isProcessAlive(state.pid)) {
+  if (isProcessAlive(state.pid) && matchesProcessIdentity(state)) {
     return { status: 'running', state }
   }
 
@@ -121,6 +151,10 @@ export async function stopDaemonByPid(
     removeDaemonState(name)
     return false
   }
+  if (!matchesProcessIdentity(state)) {
+    removeDaemonState(name)
+    return false
+  }
 
   // Send SIGTERM
   try {
@@ -143,6 +177,10 @@ export async function stopDaemonByPid(
   }
 
   // Force kill
+  if (!matchesProcessIdentity(state)) {
+    removeDaemonState(name)
+    return false
+  }
   try {
     process.kill(pid, 'SIGKILL')
   } catch {

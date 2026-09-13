@@ -155,6 +155,24 @@ describe('probeProviderModel', () => {
     expect(calls).toHaveLength(0)
   })
 
+  test('re-verifies a model a previous run marked invalid', async () => {
+    // Verification is what decides the status, so it has to be able to clear
+    // its own verdict. While the probe honoured the invalid gate, one bad key
+    // latched the model dead: every later check failed with `invalid_model`
+    // and no corrected credential could ever restore it.
+    const configuration = openAiConfig()
+    configuration.providers[0]!.models[0]!.validation = { status: 'invalid' }
+    const { fetch, calls } = fetchReturning(200)
+    const outcome = await probeProviderModel(
+      configuration,
+      'p1',
+      'm1',
+      overrides(fetch),
+    )
+    expect(outcome).toEqual({ status: 'valid' })
+    expect(calls).toHaveLength(1)
+  })
+
   test('reports unsupported for cloud-chain kinds with no cheap probe', async () => {
     const { fetch, calls } = fetchReturning(200)
     const outcome = await probeProviderModel(

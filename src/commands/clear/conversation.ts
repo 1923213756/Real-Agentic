@@ -183,7 +183,7 @@ export async function clearConversation({
         try {
           if (task.status === 'running') {
             if (isLocalShellTask(task)) {
-              task.shellCommand?.kill()
+              void task.shellCommand?.kill()
               task.shellCommand?.cleanup()
               if (task.cleanupTimeoutId) {
                 clearTimeout(task.cleanupTimeoutId)

@@ -96,6 +96,23 @@ describe('provider secret store', () => {
     expect(env.OPENAI_API_KEY).toBe('sk-glm')
   })
 
+  test('a sibling never stands in for the active provider in a shared slot', async () => {
+    const { writeProviderSecret, hydrateProviderSecretsIntoEnv } = await import(
+      '../providerSecrets.js'
+    )
+    // Two anthropic providers share the canonical ANTHROPIC_API_KEY slot. The
+    // active one has no stored key yet; borrowing the sibling's would send a
+    // foreign credential and turn "no key configured" into a 401 that reads as
+    // "my key is wrong".
+    writeProviderSecret('anthropic-direct', 'ANTHROPIC_API_KEY', 'sk-sibling')
+    const env: Record<string, string | undefined> = {}
+    hydrateProviderSecretsIntoEnv(env, {
+      activeProviderId: 'kimi',
+      activeCredentialEnvName: 'ANTHROPIC_API_KEY',
+    })
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+  })
+
   test('a corrupt secrets file degrades to empty rather than throwing', async () => {
     const { getProviderSecretsFilePath, readProviderSecret } = await import(
       '../providerSecrets.js'

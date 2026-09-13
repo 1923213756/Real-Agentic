@@ -3,6 +3,7 @@ import { readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { logForDebugging } from 'src/utils/debug.js'
+import { getProxyFetchOptions } from 'src/utils/proxy.js'
 
 const ISSUER = 'https://auth.openai.com'
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
@@ -179,23 +180,44 @@ async function saveStoredAuth(tokens: ChatGPTAuthTokens): Promise<void> {
   await chmod(path, 0o600).catch(() => undefined)
 }
 
+/**
+ * Proxy/TLS options for every auth.openai.com call.
+ *
+ * The API-key OpenAI client already routes through this helper
+ * (services/api/openai/client.ts); the subscription path used a bare `fetch`
+ * and so was the one provider that ignored HTTPS_PROXY. Under Node that means
+ * no proxy at all — `fetch` is undici, which does not read the env vars — and
+ * even under Bun it skipped NO_PROXY and the mTLS/CA config. On a network that
+ * can only reach OpenAI through a proxy this surfaced as "ChatGPT 订阅认证不可
+ * 用": auth.openai.com answered 403 and the failure was reported as a generic
+ * auth error rather than a routing problem.
+ */
+function openAIAuthFetchOptions(): RequestInit {
+  return getProxyFetchOptions({ forAnthropicAPI: false }) as RequestInit
+}
+
 async function postJSON<T>(
   url: string,
   body: Record<string, string>,
 ): Promise<T> {
   const res = await fetch(url, {
+    ...openAIAuthFetchOptions(),
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    throw new Error(`ChatGPT auth request failed (${res.status})`)
+    const text = await res.text().catch(() => '')
+    throw new Error(
+      `ChatGPT auth request failed (${res.status})${text ? `: ${text.slice(0, 200)}` : ''}`,
+    )
   }
   return (await res.json()) as T
 }
 
 async function postForm<T>(url: string, body: URLSearchParams): Promise<T> {
   const res = await fetch(url, {
+    ...openAIAuthFetchOptions(),
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
@@ -248,6 +270,7 @@ async function pollForAuthorizationCode(
   while (Date.now() - started < 15 * 60 * 1000) {
     if (signal?.aborted) throw new Error('ChatGPT login cancelled')
     const res = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
+      ...openAIAuthFetchOptions(),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

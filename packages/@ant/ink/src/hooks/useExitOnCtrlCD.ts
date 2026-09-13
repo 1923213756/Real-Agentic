@@ -56,8 +56,8 @@ function useDoublePress(
  * keybinding system.
  */
 export function useExitOnCtrlCDWithKeybindings(
-  _onExit?: () => void,
-  _onInterrupt?: () => boolean,
+  onExit?: () => void,
+  onInterrupt?: () => boolean,
   isActive: boolean = true,
 ): ExitState {
   const [exitState, setExitState] = useState<ExitState>({
@@ -65,28 +65,40 @@ export function useExitOnCtrlCDWithKeybindings(
     keyName: null,
   })
 
+  const exit = useCallback(() => {
+    if (onExit) {
+      onExit()
+      return
+    }
+    // Let the application-level shutdown coordinator reap children. Keep the
+    // standalone fallback for consumers that did not install signal handlers.
+    if (process.listenerCount('SIGINT') > 0) process.emit('SIGINT')
+    else process.exit(0)
+  }, [onExit])
+
   const handleCtrlC = useDoublePress(
     (pending: boolean) =>
       setExitState({ pending, keyName: pending ? 'Ctrl-C' : null }),
-    () => process.exit(0),
+    exit,
   )
 
   const handleCtrlD = useDoublePress(
     (pending: boolean) =>
       setExitState({ pending, keyName: pending ? 'Ctrl-D' : null }),
-    () => process.exit(0),
+    exit,
   )
 
   const handleInput = useCallback(
     (_input: string, key: { ctrl?: boolean; name?: string }) => {
       if (!isActive) return
       if (key.ctrl && key.name === 'c') {
+        if (onInterrupt?.()) return
         handleCtrlC()
       } else if (key.ctrl && key.name === 'd') {
         handleCtrlD()
       }
     },
-    [isActive, handleCtrlC, handleCtrlD],
+    [isActive, onInterrupt, handleCtrlC, handleCtrlD],
   )
 
   useInput(handleInput, { isActive })

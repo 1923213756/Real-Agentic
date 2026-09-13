@@ -26,7 +26,18 @@ export function getAPIProvider(
   settings: Pick<SettingsJson, 'modelType'> = getInitialSettings(),
 ): APIProvider {
   if (runtimeProviderOverride !== null) return runtimeProviderOverride
-  const modelType = settings.modelType
+  // When the host owns inference routing (a bridge session launched from the
+  // provider catalog sets CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST), settings.json
+  // must not pick the provider. modelType outranks every env var below, so a
+  // terminal-only `modelType: "openai"` silently sent catalog sessions down the
+  // OpenAI path — an anthropic-compatible provider selected in the panel went
+  // out to OPENAI_BASE_URL instead, i.e. a different vendor than the one shown.
+  // The env vars below come from the host's own projection, so they still win.
+  const modelType = isEnvTruthy(
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST,
+  )
+    ? undefined
+    : settings.modelType
   if (modelType === 'openai') return 'openai'
   if (modelType === 'gemini') return 'gemini'
   if (modelType === 'grok') return 'grok'

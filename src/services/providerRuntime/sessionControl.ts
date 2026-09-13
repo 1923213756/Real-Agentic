@@ -9,6 +9,7 @@ import {
   getRuntimeProviderOverride,
   setRuntimeProviderOverride,
 } from '../../utils/model/providers.js'
+import { providerCredentialEnvName } from './resolveSnapshot.js'
 import {
   clearProviderDerivedCaches,
   ProviderRuntimeService,
@@ -114,7 +115,12 @@ export async function activateSessionModelRequest(
   // slot may be empty (a sibling provider's save cleared it), which would make
   // resolveProviderRuntimeSnapshot throw authentication_required even though
   // the key is safely stored. hydrate makes the target provider win its slot.
-  hydrateProviderSecretsIntoEnv(process.env, { activeProviderId: provider.id })
+  hydrateProviderSecretsIntoEnv(process.env, {
+    activeProviderId: provider.id,
+    ...(providerCredentialEnvName(provider) === undefined
+      ? {}
+      : { activeCredentialEnvName: providerCredentialEnvName(provider) }),
+  })
 
   return dependencies.activate(
     {

@@ -7,6 +7,10 @@ import { cancelPendingPermissions, createClient } from './acp-client.js'
 import { buildAgentEnv } from './permission-mode.js'
 import { clients, getAgentConfig, logAgent } from './runtime-state.js'
 import {
+  registerManagedProcess,
+  terminateProcessTree,
+} from '../process-tree.js'
+import {
   JSONRPC_INTERNAL_ERROR,
   type AgentCapabilities,
   type ClientState,
@@ -44,7 +48,7 @@ export async function handleConnect(ws: WSContext): Promise<void> {
   // Kill existing process if any (only if not healthy)
   if (state.process) {
     cancelPendingPermissions(state)
-    state.process.kill()
+    await terminateProcessTree(state.process.pid, process.platform !== 'win32')
     state.process = null
     state.connection = null
   }
@@ -55,13 +59,22 @@ export async function handleConnect(ws: WSContext): Promise<void> {
     const agentProcess = spawn(AGENT_COMMAND, AGENT_ARGS, {
       cwd: AGENT_CWD,
       stdio: ['pipe', 'pipe', 'inherit'],
-      env: buildAgentEnv(),
+      env: {
+        ...buildAgentEnv(),
+        CLAUDE_CODE_MANAGED_PARENT_PID: String(process.pid),
+      },
+      detached: process.platform !== 'win32',
     })
+    const unregisterManaged = registerManagedProcess(
+      agentProcess.pid,
+      process.platform !== 'win32',
+    )
 
     state.process = agentProcess
 
     // Clean up state when agent process exits unexpectedly
     agentProcess.on('exit', code => {
+      unregisterManaged()
       logAgent.info({ exitCode: code }, 'agent process exited')
       // Only clear if this is still the current process
       if (state.process === agentProcess) {
@@ -132,6 +145,16 @@ export async function handleConnect(ws: WSContext): Promise<void> {
       send(ws, 'status', { connected: false })
     })
   } catch (error) {
+    cancelPendingPermissions(state)
+    const failedProcess = state.process
+    state.process = null
+    state.connection = null
+    if (failedProcess) {
+      await terminateProcessTree(
+        failedProcess.pid,
+        process.platform !== 'win32',
+      )
+    }
     logAgent.error({ error: (error as Error).message }, 'connect failed')
     sendJsonRpcError(
       ws,
@@ -143,13 +166,14 @@ export async function handleConnect(ws: WSContext): Promise<void> {
   }
 }
 
-export function handleDisconnect(ws: WSContext): void {
+export async function handleDisconnect(ws: WSContext): Promise<void> {
   const state = clients.get(ws)
   if (!state) return
 
   if (state.process) {
-    state.process.kill()
+    const child = state.process
     state.process = null
+    await terminateProcessTree(child.pid, process.platform !== 'win32')
   }
   state.connection = null
   state.sessionId = null

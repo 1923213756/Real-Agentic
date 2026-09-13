@@ -1,8 +1,5 @@
 import { createHash } from 'node:crypto'
-import {
-  CHATGPT_CODEX_DEFAULT_MODEL,
-  CHATGPT_CODEX_FAST_MODEL,
-} from '../../utils/model/chatgptModels.js'
+import { CHATGPT_CODEX_MODEL_OPTIONS } from '../../utils/model/chatgptModels.js'
 import { RedactedProviderProfileSchema } from './types.js'
 import type {
   AuthScheme,
@@ -224,14 +221,12 @@ function detectOpenAI(
   const storedAuth = options.chatGPTAuthConfigured === true
   const profiles: DetectedProviderProfile[] = []
   if (authMode?.value === 'chatgpt' || storedAuth) {
+    const fallbackModels = CHATGPT_CODEX_MODEL_OPTIONS.map(
+      option => option.value,
+    )
     const models =
       storedAuth && authMode?.value !== 'chatgpt'
-        ? detectModels(
-            {},
-            {},
-            [],
-            [CHATGPT_CODEX_DEFAULT_MODEL, CHATGPT_CODEX_FAST_MODEL],
-          )
+        ? detectModels({}, {}, [], fallbackModels)
         : detectModels(
             settings,
             env,
@@ -241,7 +236,7 @@ function detectOpenAI(
               'OPENAI_DEFAULT_SONNET_MODEL',
               'OPENAI_DEFAULT_OPUS_MODEL',
             ],
-            [CHATGPT_CODEX_DEFAULT_MODEL, CHATGPT_CODEX_FAST_MODEL],
+            fallbackModels,
           )
     profiles.push(
       buildProfile({

@@ -1,4 +1,8 @@
 import type { AcpInstance, InstanceSummary, LogEntry } from './types.js'
+import {
+  registerManagedProcess,
+  terminateProcessTree,
+} from '../process-tree.js'
 
 function log(tag: string, msg: string) {
   const ts = new Date().toISOString()
@@ -6,8 +10,6 @@ function log(tag: string, msg: string) {
 }
 
 const MAX_LOG_LINES = 2000
-const SHUTDOWN_TIMEOUT_MS = 5000
-
 export class ProcessManager {
   private instances = new Map<string, AcpInstance>()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -33,8 +35,17 @@ export class ProcessManager {
     const proc = Bun.spawn(['acp-link', ...fullArgs], {
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...Bun.env, ACP_CHILD: '1' },
+      env: {
+        ...Bun.env,
+        ACP_CHILD: '1',
+        CLAUDE_CODE_MANAGED_PARENT_PID: String(process.pid),
+      },
+      detached: process.platform !== 'win32',
     })
+    const unregisterManaged = registerManagedProcess(
+      proc.pid,
+      process.platform !== 'win32',
+    )
 
     instance.pid = proc.pid
     this.instances.set(id, instance)
@@ -48,6 +59,7 @@ export class ProcessManager {
     this.pipeStream(proc.stderr, id, 'stderr')
 
     proc.exited.then(code => {
+      unregisterManaged()
       instance.status = code === 0 ? 'stopped' : 'failed'
       instance.exitCode = code
       instance.pid = undefined
@@ -67,7 +79,7 @@ export class ProcessManager {
     if (!proc) return false
     const inst = this.instances.get(id)
     log('manager', `stopping instance ${id.slice(0, 8)} pid=${proc.pid}`)
-    proc.kill('SIGTERM')
+    void terminateProcessTree(proc.pid, process.platform !== 'win32')
     // Immediately mark as stopped to prevent stale state
     if (inst) {
       inst.status = 'stopped'
@@ -105,31 +117,12 @@ export class ProcessManager {
     if (running.length === 0) return
 
     log('manager', `shutting down ${running.length} running instance(s)...`)
-    for (const [id, proc] of running) {
-      try {
-        proc.kill('SIGTERM')
-        log('manager', `sent SIGTERM to ${id.slice(0, 8)} pid=${proc.pid}`)
-      } catch {
-        // already dead
-      }
-    }
-
-    const timeout = new Promise<void>(resolve =>
-      setTimeout(resolve, SHUTDOWN_TIMEOUT_MS),
+    await Promise.allSettled(
+      running.map(async ([id, proc]) => {
+        log('manager', `terminating ${id.slice(0, 8)} pid=${proc.pid}`)
+        await terminateProcessTree(proc.pid, process.platform !== 'win32')
+      }),
     )
-    await Promise.race([
-      Promise.all(running.map(([, proc]) => proc.exited.catch(() => {}))),
-      timeout,
-    ])
-
-    for (const [id, proc] of running) {
-      try {
-        proc.kill('SIGKILL')
-        log('manager', `sent SIGKILL to ${id.slice(0, 8)}`)
-      } catch {
-        // already dead
-      }
-    }
     log('manager', 'all instances shut down')
   }
 

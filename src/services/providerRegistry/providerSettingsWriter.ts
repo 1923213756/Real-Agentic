@@ -3,6 +3,7 @@ import { removeChatGPTAuth } from '../api/openai/chatgptAuth.js'
 import { clearOpenAIClientCache } from '../api/openai/client.js'
 import { updateSettingsForSource } from '../../utils/settings/settings.js'
 import {
+  CHATGPT_CODEX_BALANCED_MODEL,
   CHATGPT_CODEX_DEFAULT_MODEL,
   CHATGPT_CODEX_FAST_MODEL,
 } from '../../utils/model/chatgptModels.js'
@@ -39,6 +40,14 @@ export type ProviderSettingsWriterDependencies = {
   clearOpenAI: () => void
   clearGrok: () => void
   removeChatGPT: () => Promise<void>
+  /**
+   * Persist one provider's credential to the durable per-provider store.
+   * Injected rather than called directly so tests that already stub `update`
+   * cannot reach the real ~/.claude/provider-secrets.json — an unstubbed call
+   * here wrote fixture credentials into the developer's own config, where
+   * hydrateProviderSecretsIntoEnv then fed them to real sessions.
+   */
+  writeSecret: (providerId: string, envName: string, value: string) => void
 }
 
 const PROVIDER_FLAGS = [
@@ -60,6 +69,7 @@ const defaultDependencies: ProviderSettingsWriterDependencies = {
   clearOpenAI: clearOpenAIClientCache,
   clearGrok: clearGrokClientCache,
   removeChatGPT: removeChatGPTAuth,
+  writeSecret: writeProviderSecret,
 }
 
 function setIfPresent(
@@ -138,7 +148,11 @@ function buildPatch(
         'OPENAI',
         input.models.length > 0
           ? input.models
-          : [CHATGPT_CODEX_FAST_MODEL, CHATGPT_CODEX_DEFAULT_MODEL],
+          : [
+              CHATGPT_CODEX_FAST_MODEL,
+              CHATGPT_CODEX_BALANCED_MODEL,
+              CHATGPT_CODEX_DEFAULT_MODEL,
+            ],
       )
       return { modelType: 'openai', env }
     case 'gemini':
@@ -224,7 +238,7 @@ export async function saveProviderCredentialSettings(
   const envName = providerCredentialEnvName(input.provider)
   if (envName) {
     try {
-      writeProviderSecret(input.provider.id, envName, input.credential)
+      dependencies.writeSecret(input.provider.id, envName, input.credential)
     } catch {
       // Non-fatal — fall through to the settings write below.
     }

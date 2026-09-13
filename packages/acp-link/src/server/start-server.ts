@@ -15,6 +15,7 @@ import { cancelPendingPermissions } from './acp-client.js'
 import { sendJsonRpcError } from './client-send.js'
 import { dispatchClientMessage, dispatchJsonRpcMessage } from './dispatch.js'
 import { handleDisconnect } from './handlers-agent.js'
+import { startManagedParentWatch } from '../process-tree.js'
 import { decodeClientMessage } from './payload-decode.js'
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -177,7 +178,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
           if (state) {
             cancelPendingPermissions(state)
           }
-          handleDisconnect(ws)
+          void handleDisconnect(ws)
           clients.delete(ws)
         },
       }
@@ -201,7 +202,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
   injectWebSocket(server)
 
   // Heartbeat: periodically ping all connected clients
-  setInterval(() => {
+  const heartbeat = setInterval(() => {
     for (const [ws, state] of clients) {
       // Skip virtual relay connections (no raw socket, always alive)
       if (!ws.raw && state.isAlive) continue
@@ -276,16 +277,33 @@ export async function startServer(config: ServerConfig): Promise<void> {
   )
 
   // Graceful shutdown — close RCS upstream
+  let shuttingDown = false
+  let resolveShutdown!: () => void
+  const shutdownComplete = new Promise<void>(resolve => {
+    resolveShutdown = resolve
+  })
   const shutdown = async () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    clearInterval(heartbeat)
+    await Promise.allSettled([...clients.keys()].map(handleDisconnect))
+    clients.clear()
     const upstream = getRcsUpstream()
     if (upstream) {
       await upstream.close()
     }
-    process.exit(0)
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    resolveShutdown()
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+  if (process.platform !== 'win32') process.on('SIGHUP', shutdown)
+  const stopParentWatch = startManagedParentWatch(() => void shutdown())
 
   // Keep the server running
-  await new Promise(() => {})
+  await shutdownComplete
+  stopParentWatch()
+  process.off('SIGINT', shutdown)
+  process.off('SIGTERM', shutdown)
+  if (process.platform !== 'win32') process.off('SIGHUP', shutdown)
 }

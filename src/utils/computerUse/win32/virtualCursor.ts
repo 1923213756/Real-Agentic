@@ -15,6 +15,7 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
+import { registerManagedProcess } from '../../processTermination.js'
 import { validateHwnd, getTmpDir } from './shared.js'
 
 const CURSOR_SIZE = 20
@@ -209,6 +210,10 @@ export function showVirtualCursor(hwnd: string): boolean {
       ],
       { stdout: 'ignore', stderr: 'ignore' },
     )
+    const unregister = registerManagedProcess(cursorProc.pid, {
+      label: 'computer-use-virtual-cursor',
+    })
+    void cursorProc.exited.then(unregister, unregister)
     cursorStopFile = stopFile
     cursorScriptFile = scriptFile
     return true
@@ -239,19 +244,22 @@ export function moveVirtualCursor(
  * Hide and destroy the virtual cursor.
  */
 export function hideVirtualCursor(): void {
+  const proc = cursorProc
+  const stopPath = cursorStopFile
+  const scriptPath = cursorScriptFile
   if (cursorStopFile) {
     try {
       fs.writeFileSync(cursorStopFile, 'STOP', 'utf-8')
     } catch {}
     setTimeout(() => {
       try {
-        cursorProc?.kill()
+        proc?.kill()
       } catch {}
       try {
-        if (cursorScriptFile) fs.unlinkSync(cursorScriptFile)
+        if (scriptPath) fs.unlinkSync(scriptPath)
       } catch {}
       try {
-        if (cursorStopFile) fs.unlinkSync(cursorStopFile)
+        if (stopPath) fs.unlinkSync(stopPath)
       } catch {}
     }, 2000)
   }

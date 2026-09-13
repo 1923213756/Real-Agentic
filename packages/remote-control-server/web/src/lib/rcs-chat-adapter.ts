@@ -175,13 +175,15 @@ export class RCSChatAdapter {
       })
       if (signal?.aborted || generation !== this.generation) return cursor
 
-      const beforePage = this.state
       for (const event of page.events) {
         if (isBridgeNoise(event)) continue
+        const wasSeen = this.state.seenEventIds.has(event.id)
+        const previousState = this.state
         this.state = reduceSessionEvent(this.state, event)
+        this.notifyDerivedState(previousState)
+        if (!wasSeen) this.notifyEvent(event)
       }
       this.setEntries(this.state.entries)
-      this.notifyDerivedState(beforePage)
 
       const nextCursor = page.next_cursor
       if (!page.has_more) return nextCursor
@@ -314,6 +316,10 @@ export class RCSChatAdapter {
     this.notifyDerivedState(previousState)
     if (wasSeen) return
 
+    this.notifyEvent(event)
+  }
+
+  private notifyEvent(event: SessionEvent): void {
     const payload = event.payload ?? ({} as EventPayload)
     const rawPayload =
       payload.raw && typeof payload.raw === 'object' ? payload.raw : undefined
@@ -327,9 +333,17 @@ export class RCSChatAdapter {
     }
     if (event.type === 'session_start_failed') {
       const code =
-        typeof payload.code === 'string' ? payload.code : 'session_start_failed'
+        typeof payload.code === 'string'
+          ? payload.code
+          : typeof rawPayload?.code === 'string'
+            ? rawPayload.code
+            : 'session_start_failed'
       const message =
-        typeof payload.message === 'string' ? payload.message : code
+        typeof payload.message === 'string'
+          ? payload.message
+          : typeof rawPayload?.message === 'string'
+            ? rawPayload.message
+            : code
       this.onError?.(`${code}: ${message}`)
       return
     }

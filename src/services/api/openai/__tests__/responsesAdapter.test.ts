@@ -1,6 +1,11 @@
-import { describe, expect, test } from 'bun:test'
-import { buildResponsesRequest, extractUsage } from '../responsesAdapter.js'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import {
+  buildResponsesRequest,
+  createChatGPTResponsesStream,
+  extractUsage,
+} from '../responsesAdapter.js'
 import { formatOpenAIPromptCacheKey } from '../openaiShared.js'
+import { getProxyFetchOptions } from '../../../../utils/proxy.js'
 import { calculateCacheHitRate } from '../../../../utils/cacheWarning.js'
 
 describe('buildResponsesRequest', () => {
@@ -165,5 +170,83 @@ describe('extractUsage (OpenAI Responses → Anthropic usage)', () => {
     expect(usage.cache_read_input_tokens).toBe(4_000)
     expect(usage.cache_creation_input_tokens).toBe(1_000)
     expect(usage.input_tokens).toBe(0)
+  })
+})
+
+describe('createChatGPTResponsesStream transport', () => {
+  // getProxyUrl() falls back through all four spellings, so a developer shell
+  // that exports only HTTP_PROXY still counts as "proxied" — clear them all.
+  const PROXY_KEYS = [
+    'HTTPS_PROXY',
+    'https_proxy',
+    'HTTP_PROXY',
+    'http_proxy',
+  ] as const
+  const saved: Record<string, string | undefined> = {}
+
+  beforeEach(() => {
+    for (const key of PROXY_KEYS) {
+      saved[key] = process.env[key]
+      delete process.env[key]
+    }
+  })
+
+  afterEach(() => {
+    for (const key of PROXY_KEYS) {
+      if (saved[key] === undefined) delete process.env[key]
+      else process.env[key] = saved[key]
+    }
+  })
+
+  async function capture(): Promise<Record<string, unknown>> {
+    let init: Record<string, unknown> | undefined
+    const fetchOverride = (async (_url: unknown, options: unknown) => {
+      init = options as Record<string, unknown>
+      return new Response('data: [DONE]\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+    }) as unknown as typeof fetch
+
+    await createChatGPTResponsesStream({
+      request: buildResponsesRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [],
+        toolChoice: undefined,
+        promptCacheKey: formatOpenAIPromptCacheKey('session-proxy'),
+      }),
+      signal: new AbortController().signal,
+      fetchOverride,
+    })
+    return init ?? {}
+  }
+
+  test('hands the shared proxy options to the Codex backend request', async () => {
+    // The API-key OpenAI client already goes through utils/proxy; this path
+    // used a bare fetch, so on a network that can only reach OpenAI through a
+    // proxy the subscription provider could not send a single request. The
+    // invariant is that whatever utils/proxy resolves actually reaches fetch —
+    // asserted against the helper itself so a sibling suite that stubs it
+    // process-globally cannot turn this into a false positive.
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:7890'
+    const expected = getProxyFetchOptions({ forAnthropicAPI: false }) as Record<
+      string,
+      unknown
+    >
+
+    const init = await capture()
+
+    for (const [key, value] of Object.entries(expected)) {
+      expect(init[key]).toEqual(value)
+    }
+    expect(init.method).toBe('POST')
+  })
+
+  test('still sends the request when the host has no proxy configured', async () => {
+    const init = await capture()
+
+    expect(init.proxy).toBeUndefined()
+    expect(init.method).toBe('POST')
   })
 })

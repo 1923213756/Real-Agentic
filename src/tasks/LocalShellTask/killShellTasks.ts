@@ -21,7 +21,7 @@ export function killTask(taskId: string, setAppState: SetAppStateFn): void {
 
     try {
       logForDebugging(`LocalShellTask ${taskId} kill requested`)
-      task.shellCommand?.kill()
+      void task.shellCommand?.kill()
       task.shellCommand?.cleanup()
     } catch (error) {
       logError(error)

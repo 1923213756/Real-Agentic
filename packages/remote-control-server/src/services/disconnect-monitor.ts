@@ -14,6 +14,7 @@ import {
   updateSessionStatus,
   updateSessionWorkerStatus,
   incrementEpoch,
+  terminateSessionChildBestEffort,
 } from './session'
 import { probeArchivedCodeProjects } from './code-project-lifecycle'
 import { retryChatCleanupTombstones } from './chat-cleanup'
@@ -64,8 +65,11 @@ export function runDisconnectMonitorSweep(now = Date.now()) {
         if (session.status === 'running') {
           updateSessionStatus(session.id, 'idle')
         }
-        updateSessionWorkerStatus(session.id, 'offline')
+        // Reap while the pre-existing session_worker row still describes the
+        // child. updateSessionWorkerStatus creates that row when absent, which
+        // must not make a never-started session look like it owns a process.
         reapStaleSessionWorker(session.id)
+        updateSessionWorkerStatus(session.id, 'offline')
       }
     }
   }
@@ -80,9 +84,9 @@ export function runDisconnectMonitorSweep(now = Date.now()) {
  *     worker. Completing it (pending work is left alone — it was never taken)
  *     lets dispatchWorkForUserInput queue new work.
  *  2. A still-alive-but-disconnected zombie worker holds the bridge's session
- *     slot. Bumping the epoch fences it: its next epoch-checked request (SSE
- *     reconnect or heartbeat) returns 409 and it exits, freeing the slot so
- *     the next message respawns cleanly.
+ *     slot. Bumping the epoch fences future requests, while the durable
+ *     terminate command actively reaps a child that is stuck in its own exit
+ *     path and can no longer make an epoch-checked request.
  *
  * Best-effort: a throw here must not abort the rest of the sweep.
  */
@@ -93,6 +97,7 @@ function reapStaleSessionWorker(sessionId: string): void {
       storeUpdateWorkItem(openWork.id, { state: 'completed' })
     }
     incrementEpoch(sessionId)
+    terminateSessionChildBestEffort(sessionId)
   } catch (err) {
     logError(
       `[RCS] Failed to reap stale worker for session ${sessionId}: ${

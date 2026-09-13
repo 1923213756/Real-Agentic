@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { detectExistingProviderProfiles } from '../existingProviderDetector.js'
 import {
   CHATGPT_CODEX_DEFAULT_MODEL,
-  CHATGPT_CODEX_FAST_MODEL,
+  CHATGPT_CODEX_MODEL_OPTIONS,
 } from '../../../utils/model/chatgptModels.js'
 
 describe('detectExistingProviderProfiles', () => {
@@ -99,10 +99,10 @@ describe('detectExistingProviderProfiles', () => {
       id: 'detected-chatgpt',
       auth: { configured: true },
     })
-    expect(chatgpt?.models.map(model => model.remoteModelId)).toEqual([
-      CHATGPT_CODEX_DEFAULT_MODEL,
-      CHATGPT_CODEX_FAST_MODEL,
-    ])
+    expect(chatgpt?.models.map(model => model.remoteModelId)).toEqual(
+      CHATGPT_CODEX_MODEL_OPTIONS.map(option => option.value),
+    )
+    expect(chatgpt?.models[0]?.remoteModelId).toBe(CHATGPT_CODEX_DEFAULT_MODEL)
   })
 
   test('keeps an explicit OpenAI-compatible provider visible beside stored ChatGPT auth', () => {

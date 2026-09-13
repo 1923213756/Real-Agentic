@@ -10,6 +10,7 @@
 
 import * as path from 'path'
 import type { Writable } from 'stream'
+import { registerManagedProcess } from '../../processTermination.js'
 
 interface BridgeRequest {
   id: number
@@ -47,6 +48,10 @@ export function ensureBridge(): boolean {
       stderr: 'ignore',
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' },
     })
+    const unregister = registerManagedProcess(bridgeProc.pid, {
+      label: 'computer-use-python-bridge',
+    })
+    void bridgeProc.exited.then(unregister, unregister)
 
     // Read stdout lines asynchronously
     const reader = (bridgeProc.stdout as ReadableStream<Uint8Array>).getReader()

@@ -291,7 +291,7 @@ export async function finalizePendingAsyncHooks(): Promise<void> {
         )
       } else {
         if (hook.shellCommand && hook.shellCommand.status !== 'killed') {
-          hook.shellCommand.kill()
+          await hook.shellCommand.kill()
         }
         await finalizeHook(hook, 1, 'cancelled')
       }

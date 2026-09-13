@@ -10,6 +10,11 @@ import { logForDebugging } from '../utils/debug.js'
 import { isEnvTruthy, isRunningOnHomespace } from '../utils/envUtils.js'
 import { logError } from '../utils/log.js'
 import { getPlatform } from '../utils/platform.js'
+import { registerCleanup } from '../utils/cleanupRegistry.js'
+import {
+  registerManagedChildProcess,
+  terminateProcessTree,
+} from '../utils/processTermination.js'
 
 // Lazy-loaded native audio module. audio-capture.node links against
 // CoreAudio.framework + AudioUnit.framework; dlopen is synchronous and
@@ -20,6 +25,7 @@ import { getPlatform } from '../utils/platform.js'
 type AudioNapi = typeof import('audio-capture-napi')
 let audioNapi: AudioNapi | null = null
 let audioNapiPromise: Promise<AudioNapi> | null = null
+let voiceCleanupRegistered = false
 
 function loadAudioNapi(): Promise<AudioNapi> {
   audioNapiPromise ??= (async () => {
@@ -330,6 +336,7 @@ export async function checkRecordingAvailability(): Promise<RecordingAvailabilit
 // ─── Recording (native audio on macOS/Linux/Windows, SoX/arecord fallback on Linux) ─────────────
 
 let activeRecorder: ChildProcess | null = null
+let activeRecorderTermination: Promise<void> | null = null
 let nativeRecordingActive = false
 
 export async function startRecording(
@@ -440,9 +447,11 @@ function startSoxRecording(
 
   const child = spawn('rec', args, {
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
   })
 
   activeRecorder = child
+  trackRecorder(child)
 
   child.stdout?.on('data', (chunk: Buffer) => {
     onData(chunk)
@@ -452,13 +461,13 @@ function startSoxRecording(
   child.stderr?.on('data', () => {})
 
   child.on('close', () => {
-    activeRecorder = null
+    if (activeRecorder === child) activeRecorder = null
     onEnd()
   })
 
   child.on('error', err => {
     logError(err)
-    activeRecorder = null
+    if (activeRecorder === child) activeRecorder = null
     onEnd()
   })
 
@@ -487,9 +496,11 @@ function startArecordRecording(
 
   const child = spawn('arecord', args, {
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
   })
 
   activeRecorder = child
+  trackRecorder(child)
 
   child.stdout?.on('data', (chunk: Buffer) => {
     onData(chunk)
@@ -499,13 +510,13 @@ function startArecordRecording(
   child.stderr?.on('data', () => {})
 
   child.on('close', () => {
-    activeRecorder = null
+    if (activeRecorder === child) activeRecorder = null
     onEnd()
   })
 
   child.on('error', err => {
     logError(err)
-    activeRecorder = null
+    if (activeRecorder === child) activeRecorder = null
     onEnd()
   })
 
@@ -519,7 +530,38 @@ export function stopRecording(): void {
     return
   }
   if (activeRecorder) {
-    activeRecorder.kill('SIGTERM')
+    const recorder = activeRecorder
     activeRecorder = null
+    const termination = terminateProcessTree({
+      pid: recorder.pid!,
+      processGroup: process.platform !== 'win32',
+      steps: [
+        { signal: 'SIGTERM', waitMs: 300 },
+        { signal: 'SIGKILL', waitMs: 500 },
+      ],
+      label: 'voice-recorder',
+    }).then(() => {})
+    activeRecorderTermination = termination
+    void termination.finally(() => {
+      if (activeRecorderTermination === termination) {
+        activeRecorderTermination = null
+      }
+    })
   }
+}
+
+function trackRecorder(child: ChildProcess): void {
+  registerManagedChildProcess(child, {
+    processGroup: process.platform !== 'win32',
+    label: 'voice-recorder',
+  })
+  if (voiceCleanupRegistered) return
+  voiceCleanupRegistered = true
+  registerCleanup(
+    async () => {
+      stopRecording()
+      await activeRecorderTermination
+    },
+    { name: 'voice-recorder', phase: 'terminate', timeoutMs: 1_500 },
+  )
 }

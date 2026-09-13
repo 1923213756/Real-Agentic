@@ -14,6 +14,8 @@ import {
   runBridgeHeadless,
 } from '../src/bridge/bridgeMain.js'
 import { buildSourceCliLaunchSpec } from './cli-launch.ts'
+import { startManagedParentWatch } from './rcs-stack/parent-watch.js'
+import { MANAGED_SESSION_SHUTDOWN_GRACE_MS } from './rcs-stack/shutdown-policy.js'
 
 // Direct Bun execution does not pass through cli.tsx, so provide the small
 // runtime MACRO surface used by bridge API registration and diagnostics.
@@ -40,9 +42,14 @@ function spawnMode(value: string | undefined): 'same-dir' | 'worktree' {
 }
 
 const abortController = new AbortController()
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  if (signal === 'SIGHUP' && process.platform === 'win32') continue
   process.once(signal, () => abortController.abort())
 }
+const stopParentWatch = startManagedParentWatch(() => {
+  console.error('[worker] Stack supervisor exited; shutting down Worker')
+  abortController.abort()
+})
 
 const accessToken = (): string | undefined =>
   process.env.CLAUDE_BRIDGE_OAUTH_TOKEN || getBridgeAccessToken()
@@ -69,6 +76,7 @@ try {
         process.env.CLAUDE_BRIDGE_SESSION_TIMEOUT_MS,
         24 * 60 * 60 * 1000,
       ),
+      shutdownGraceMs: MANAGED_SESSION_SHUTDOWN_GRACE_MS,
       createSessionOnStart:
         process.env.CLAUDE_BRIDGE_CREATE_SESSION_ON_START === '1',
       getAccessToken: accessToken,
@@ -86,4 +94,6 @@ try {
     `[worker] ${error instanceof Error ? error.message : String(error)}`,
   )
   process.exitCode = error instanceof BridgeHeadlessPermanentError ? 78 : 1
+} finally {
+  stopParentWatch()
 }

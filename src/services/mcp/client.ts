@@ -65,6 +65,10 @@ import {
   handleOAuth401Error,
 } from '../../utils/auth.js'
 import { registerCleanup } from '../../utils/cleanupRegistry.js'
+import {
+  registerManagedProcess,
+  terminateProcessTree,
+} from '../../utils/processTermination.js'
 import { detectCodeIndexingFromMcpServerName } from '../../utils/codeIndexing.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvDefinedFalsy, isEnvTruthy } from '../../utils/envUtils.js'
@@ -1056,7 +1060,28 @@ export const connectToServer = memoize(
         }
       }
 
+      let registeredStdioPid: number | undefined
+      let unregisterManagedStdio = (): void => {}
+      const ensureStdioProcessManaged = (): number | undefined => {
+        if (serverRef.type !== 'stdio' && serverRef.type !== undefined) {
+          return undefined
+        }
+        const childPid = (transport as StdioClientTransport).pid ?? undefined
+        if (childPid && childPid !== registeredStdioPid) {
+          unregisterManagedStdio()
+          registeredStdioPid = childPid
+          unregisterManagedStdio = registerManagedProcess(childPid, {
+            label: `mcp-${name}`,
+          })
+        }
+        return childPid
+      }
+
       const connectPromise = client.connect(transport)
+      // StdioClientTransport starts synchronously before its first await in
+      // normal SDK versions. Register immediately to close the SIGKILL window;
+      // call again after connection for compatibility with lazy transports.
+      ensureStdioProcessManaged()
       const timeoutPromise = new Promise<never>((_, reject) => {
         const timeoutId = setTimeout(() => {
           const elapsed = Date.now() - connectStartTime
@@ -1089,6 +1114,7 @@ export const connectToServer = memoize(
 
       try {
         await Promise.race([connectPromise, timeoutPromise])
+        ensureStdioProcessManaged()
         if (stderrOutput) {
           logMCPError(name, `Server stderr: ${stderrOutput}`)
           stderrOutput = '' // Release accumulated string to prevent memory growth
@@ -1100,6 +1126,18 @@ export const connectToServer = memoize(
         )
       } catch (error) {
         const elapsed = Date.now() - connectStartTime
+        const failedStdioPid = ensureStdioProcessManaged() ?? registeredStdioPid
+        if (failedStdioPid) {
+          await terminateProcessTree({
+            pid: failedStdioPid,
+            steps: [
+              { signal: 'SIGTERM', waitMs: 300 },
+              { signal: 'SIGKILL', waitMs: 500 },
+            ],
+            label: `failed-mcp-${name}`,
+          })
+        }
+        unregisterManagedStdio()
         // SSE-specific error logging
         if (serverRef.type === 'sse' && error instanceof Error) {
           logMCPDebug(
@@ -1383,6 +1421,7 @@ export const connectToServer = memoize(
 
       // Enhanced close handler with connection drop context
       client.onclose = () => {
+        unregisterManagedStdio()
         const uptime = Date.now() - connectionStartTime
         const transportType = serverRef.type ?? 'unknown'
 
@@ -1434,139 +1473,28 @@ export const connectToServer = memoize(
           stdioTransport.stderr?.off('data', stderrHandler)
         }
 
-        // For stdio transports, explicitly terminate the child process with proper signals
-        // NOTE: StdioClientTransport.close() only sends an abort signal, but many MCP servers
-        // (especially Docker containers) need explicit SIGINT/SIGTERM signals to trigger graceful shutdown
-        if (serverRef.type === 'stdio') {
+        // Stdio transports may launch wrappers which launch their own helpers.
+        // Snapshot and reap the complete tree; a direct PID signal is not enough.
+        if (serverRef.type === 'stdio' || !serverRef.type) {
           try {
-            const stdioTransport = transport as StdioClientTransport
-            const childPid = stdioTransport.pid
+            const childPid = ensureStdioProcessManaged() ?? registeredStdioPid
 
             if (childPid) {
-              logMCPDebug(name, 'Sending SIGINT to MCP server process')
-
-              // First try SIGINT (like Ctrl+C)
-              try {
-                process.kill(childPid, 'SIGINT')
-              } catch (error) {
-                logMCPDebug(name, `Error sending SIGINT: ${error}`)
-                return
-              }
-
-              // Wait for graceful shutdown with rapid escalation (total 500ms to keep CLI responsive)
-              // biome-ignore lint/suspicious/noAsyncPromiseExecutor: async needed for sequential await inside executor
-              await new Promise<void>(async resolve => {
-                let resolved = false
-
-                // Set up a timer to check if process still exists
-                const checkInterval = setInterval(() => {
-                  try {
-                    // process.kill(pid, 0) checks if process exists without killing it
-                    process.kill(childPid, 0)
-                  } catch {
-                    // Process no longer exists
-                    if (!resolved) {
-                      resolved = true
-                      clearInterval(checkInterval)
-                      clearTimeout(failsafeTimeout)
-                      logMCPDebug(name, 'MCP server process exited cleanly')
-                      resolve()
-                    }
-                  }
-                }, 50)
-
-                // Absolute failsafe: clear interval after 600ms no matter what
-                const failsafeTimeout = setTimeout(() => {
-                  if (!resolved) {
-                    resolved = true
-                    clearInterval(checkInterval)
-                    logMCPDebug(
-                      name,
-                      'Cleanup timeout reached, stopping process monitoring',
-                    )
-                    resolve()
-                  }
-                }, 600)
-
-                try {
-                  // Wait 100ms for SIGINT to work (usually much faster)
-                  await sleep(100)
-
-                  if (!resolved) {
-                    // Check if process still exists
-                    try {
-                      process.kill(childPid, 0)
-                      // Process still exists, SIGINT failed, try SIGTERM
-                      logMCPDebug(
-                        name,
-                        'SIGINT failed, sending SIGTERM to MCP server process',
-                      )
-                      try {
-                        process.kill(childPid, 'SIGTERM')
-                      } catch (termError) {
-                        logMCPDebug(name, `Error sending SIGTERM: ${termError}`)
-                        resolved = true
-                        clearInterval(checkInterval)
-                        clearTimeout(failsafeTimeout)
-                        resolve()
-                        return
-                      }
-                    } catch {
-                      // Process already exited
-                      resolved = true
-                      clearInterval(checkInterval)
-                      clearTimeout(failsafeTimeout)
-                      resolve()
-                      return
-                    }
-
-                    // Wait 400ms for SIGTERM to work (slower than SIGINT, often used for cleanup)
-                    await sleep(400)
-
-                    if (!resolved) {
-                      // Check if process still exists
-                      try {
-                        process.kill(childPid, 0)
-                        // Process still exists, SIGTERM failed, force kill with SIGKILL
-                        logMCPDebug(
-                          name,
-                          'SIGTERM failed, sending SIGKILL to MCP server process',
-                        )
-                        try {
-                          process.kill(childPid, 'SIGKILL')
-                        } catch (killError) {
-                          logMCPDebug(
-                            name,
-                            `Error sending SIGKILL: ${killError}`,
-                          )
-                        }
-                      } catch {
-                        // Process already exited
-                        resolved = true
-                        clearInterval(checkInterval)
-                        clearTimeout(failsafeTimeout)
-                        resolve()
-                      }
-                    }
-                  }
-
-                  // Final timeout - always resolve after 500ms max (total cleanup time)
-                  if (!resolved) {
-                    resolved = true
-                    clearInterval(checkInterval)
-                    clearTimeout(failsafeTimeout)
-                    resolve()
-                  }
-                } catch {
-                  // Handle any errors in the escalation sequence
-                  if (!resolved) {
-                    resolved = true
-                    clearInterval(checkInterval)
-                    clearTimeout(failsafeTimeout)
-                    resolve()
-                  }
-                }
+              const result = await terminateProcessTree({
+                pid: childPid,
+                steps: [
+                  { signal: 'SIGINT', waitMs: 150 },
+                  { signal: 'SIGTERM', waitMs: 500 },
+                  { signal: 'SIGKILL', waitMs: 500 },
+                ],
+                label: `mcp-${name}`,
               })
+              if (!result.exited) {
+                logMCPDebug(
+                  name,
+                  `MCP process tree still has ${result.remainingPids.length} member(s) after SIGKILL`,
+                )
+              }
             }
           } catch (processError) {
             logMCPDebug(name, `Error terminating process: ${processError}`)
@@ -1578,12 +1506,18 @@ export const connectToServer = memoize(
           await client.close()
         } catch (error) {
           logMCPDebug(name, `Error closing client: ${error}`)
+        } finally {
+          unregisterManagedStdio()
         }
       }
 
       // Register cleanup for all transport types - even network transports might need cleanup
       // This ensures all MCP servers get properly terminated, not just stdio ones
-      const cleanupUnregister = registerCleanup(cleanup)
+      const cleanupUnregister = registerCleanup(cleanup, {
+        name: `mcp-${name}`,
+        phase: 'terminate',
+        timeoutMs: 2_000,
+      })
 
       // Create the wrapped cleanup that includes unregistering
       const wrappedCleanup = async () => {

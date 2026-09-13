@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import type { BetaRawMessageStreamEvent } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { normalizeOpenAIUsage, type AnthropicUsage } from '@ant/model-provider'
+import { getProxyFetchOptions } from 'src/utils/proxy.js'
 import { getValidChatGPTAuth } from './chatgptAuth.js'
 
 type ResponsesInputItem = Record<string, unknown>
@@ -487,9 +488,14 @@ export async function createChatGPTResponsesStream(params: {
   if (auth.accountId) {
     headers['ChatGPT-Account-Id'] = auth.accountId
   }
+  // Same reason as the auth calls in chatgptAuth.ts: the Codex backend is only
+  // reachable through HTTPS_PROXY on proxied networks, and a bare fetch ignores
+  // it entirely under Node. A test fetchOverride still receives the options and
+  // is free to ignore them.
   const response = await fetchFn(
     'https://chatgpt.com/backend-api/codex/responses',
     {
+      ...(getProxyFetchOptions({ forAnthropicAPI: false }) as RequestInit),
       method: 'POST',
       headers,
       body: JSON.stringify(params.request),

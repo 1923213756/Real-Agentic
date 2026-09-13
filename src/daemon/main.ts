@@ -2,10 +2,16 @@ import { type ChildProcess } from 'child_process'
 import { resolve } from 'path'
 import { buildCliLaunch, spawnCli } from '../utils/cliLaunch.js'
 import {
+  forceKillManagedProcessesSync,
+  registerManagedChildProcess,
+  terminateProcessTree,
+} from '../utils/processTermination.js'
+import {
   writeDaemonState,
   removeDaemonState,
   queryDaemonStatus,
   stopDaemonByPid,
+  getProcessIdentity,
 } from './state.js'
 
 /**
@@ -252,27 +258,32 @@ async function runSupervisor(args: string[]): Promise<void> {
     startedAt: new Date().toISOString(),
     workerKinds: workers.map(w => w.kind),
     lastStatus: 'running',
+    processIdentity: getProcessIdentity(process.pid),
   })
 
   const controller = new AbortController()
 
   // Graceful shutdown
+  let shutdownRequested = false
   const shutdown = () => {
+    if (shutdownRequested) {
+      forceKillManagedProcessesSync()
+      return
+    }
+    shutdownRequested = true
     console.log('[daemon] supervisor shutting down...')
     controller.abort()
-    removeDaemonState()
     for (const w of workers) {
       if (w.restartTimer) {
         clearTimeout(w.restartTimer)
         w.restartTimer = null
       }
-      if (w.process && !w.process.killed) {
-        w.process.kill('SIGTERM')
-      }
     }
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
+  if (process.platform !== 'win32') process.on('SIGHUP', shutdown)
+  process.once('exit', forceKillManagedProcessesSync)
 
   // Spawn and supervise workers
   for (const worker of workers) {
@@ -290,37 +301,30 @@ async function runSupervisor(args: string[]): Promise<void> {
     controller.signal.addEventListener('abort', () => resolve(), { once: true })
   })
 
-  // Wait for all workers to exit
-  await Promise.all(
-    workers
-      .filter(w => w.process && w.process.exitCode === null)
-      .map(
-        w =>
-          new Promise<void>(resolve => {
-            if (!w.process || w.process.exitCode !== null) {
-              resolve()
-              return
-            }
-            let killTimer: ReturnType<typeof setTimeout> | null = null
-            w.process.on('exit', () => {
-              if (killTimer) {
-                clearTimeout(killTimer)
-                killTimer = null
-              }
-              resolve()
-            })
-            // Force kill after grace period
-            killTimer = setTimeout(() => {
-              if (w.process && w.process.exitCode === null) {
-                w.process.kill('SIGKILL')
-              }
-              resolve()
-            }, 30_000)
-            killTimer.unref?.()
-          }),
-      ),
+  const activeWorkers = workers
+    .map(worker => worker.process)
+    .filter(
+      (child): child is ChildProcess =>
+        child !== null && child.pid !== undefined,
+    )
+  await Promise.allSettled(
+    activeWorkers.map(child =>
+      terminateProcessTree({
+        pid: child.pid!,
+        processGroup: process.platform !== 'win32',
+        steps: [
+          { signal: 'SIGTERM', waitMs: 5_000 },
+          { signal: 'SIGKILL', waitMs: 1_000 },
+        ],
+        label: 'daemon-worker',
+      }),
+    ),
   )
 
+  removeDaemonState()
+  process.off('SIGTERM', shutdown)
+  process.off('SIGINT', shutdown)
+  if (process.platform !== 'win32') process.off('SIGHUP', shutdown)
   console.log('[daemon] supervisor stopped')
 }
 
@@ -346,6 +350,7 @@ function spawnWorker(
     DAEMON_WORKER_PERMISSION: config.permissionMode,
     DAEMON_WORKER_SANDBOX: config.sandbox || '0',
     DAEMON_WORKER_CREATE_SESSION: '1',
+    CLAUDE_CODE_MANAGED_PARENT_PID: String(process.pid),
     CLAUDE_CODE_SESSION_KIND: 'daemon-worker',
   }
 
@@ -356,6 +361,11 @@ function spawnWorker(
   const child = spawnCli(launch, {
     cwd: dir,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+  })
+  registerManagedChildProcess(child, {
+    processGroup: process.platform !== 'win32',
+    label: `daemon-worker-${worker.kind}`,
   })
 
   worker.process = child

@@ -1,4 +1,5 @@
 import type { Subprocess } from 'bun'
+import { terminateProcessTree } from '../utils/processTermination.js'
 import type { SDKMessage } from '../entrypoints/agentSdkTypes.js'
 import type {
   SDKControlPermissionRequest,
@@ -340,11 +341,25 @@ export class SSHSessionManagerImpl implements SSHSessionManager {
       // stdin may already be closed
     }
 
+    // Ask Bun's child handle to stop immediately as well as terminating the
+    // whole private process group below. Keeping the handle-level signal is
+    // useful for mocked/custom subprocess implementations and marks the root
+    // as killed without waiting for the async tree snapshot.
     try {
-      this.proc.kill()
+      this.proc.kill('SIGTERM')
     } catch {
-      // process may already be dead
+      // The process may already have exited.
     }
+
+    void terminateProcessTree({
+      pid: this.proc.pid,
+      processGroup: process.platform !== 'win32',
+      steps: [
+        { signal: 'SIGTERM', waitMs: 500 },
+        { signal: 'SIGKILL', waitMs: 500 },
+      ],
+      label: 'ssh-session',
+    })
   }
 
   isConnected(): boolean {

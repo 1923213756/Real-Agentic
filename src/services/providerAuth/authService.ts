@@ -1,4 +1,5 @@
 import { installOAuthTokens } from '../../cli/handlers/auth.js'
+import { logForDebugging } from '../../utils/debug.js'
 import {
   clearAwsCredentialsCache,
   clearGcpCredentialsCache,
@@ -111,6 +112,47 @@ function errorCode(error: unknown): string {
     return error.message
   }
   return 'provider_auth_failed'
+}
+
+/**
+ * Long opaque blobs in an error body are the only token-shaped risk here:
+ * JWTs (`ey…`) and the dotted prefix forms OpenAI/Anthropic use for refresh
+ * and API keys (`rt.1.AAA…`, `sk-…`).
+ */
+const SECRET_LIKE =
+  /\b(?:ey[A-Za-z0-9_-]{20,}[A-Za-z0-9_.-]*|(?:rt|sk|pk)[-_.][A-Za-z0-9_.-]{16,})/g
+
+/**
+ * Prepare a failure message for the browser: strip anything token-shaped,
+ * collapse whitespace and cap the length. The reason has to cross to the panel
+ * for the failure to be diagnosable at all, so it is sanitized rather than
+ * dropped.
+ */
+export function sanitizeAuthErrorDetail(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.message) return undefined
+  const detail = error.message
+    .replace(SECRET_LIKE, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!detail) return undefined
+  return detail.length > 300 ? `${detail.slice(0, 300)}…` : detail
+}
+
+/** Attach code + redacted detail to a failed operation in one place. */
+function failureStatus(
+  operation: AuthOperation,
+  error: unknown,
+): ProviderAuthOperationStatus {
+  const detail = sanitizeAuthErrorDetail(error)
+  logForDebugging(
+    `[providerAuth] ${operation.method} failed for providerId=${operation.providerId}: ${detail ?? 'unknown error'}`,
+  )
+  return {
+    ...operation.status,
+    state: operation.controller.signal.aborted ? 'cancelled' : 'failed',
+    errorCode: errorCode(error),
+    ...(detail === undefined ? {} : { errorDetail: detail }),
+  }
 }
 
 function isOAuthMethod(method: ProviderAuthMethod): boolean {
@@ -251,11 +293,7 @@ export class ProviderAuthService {
       operation.status = { ...operation.status, state: 'succeeded' }
     } catch (error) {
       if (operation.status.state === 'cancelled') return
-      operation.status = {
-        ...operation.status,
-        state: operation.controller.signal.aborted ? 'cancelled' : 'failed',
-        errorCode: errorCode(error),
-      }
+      operation.status = failureStatus(operation, error)
     } finally {
       oauth.cleanup()
       operation.oauth = undefined
@@ -283,11 +321,7 @@ export class ProviderAuthService {
       operation.status = { ...operation.status, state: 'succeeded' }
     } catch (error) {
       if (operation.status.state === 'cancelled') return
-      operation.status = {
-        ...operation.status,
-        state: operation.controller.signal.aborted ? 'cancelled' : 'failed',
-        errorCode: errorCode(error),
-      }
+      operation.status = failureStatus(operation, error)
     } finally {
       operation.deviceCode = undefined
     }
@@ -301,11 +335,7 @@ export class ProviderAuthService {
       operation.status = { ...operation.status, state: 'succeeded' }
     } catch (error) {
       if (operation.status.state === 'cancelled') return
-      operation.status = {
-        ...operation.status,
-        state: operation.controller.signal.aborted ? 'cancelled' : 'failed',
-        errorCode: errorCode(error),
-      }
+      operation.status = failureStatus(operation, error)
     }
   }
 

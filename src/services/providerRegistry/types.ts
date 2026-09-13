@@ -226,6 +226,17 @@ export type RedactedAuthReference = z.infer<typeof RedactedAuthReferenceSchema>
 
 export const RedactedProviderProfileSchema = ProviderProfileSchema.extend({
   auth: RedactedAuthReferenceSchema,
+  /**
+   * True when the profile is synthesized from ambient CLI state (stored OAuth,
+   * settings, env vars) rather than read from providers.json.
+   *
+   * Detected profiles have no catalog entry, so every catalog mutation —
+   * discover / validate / save / delete / archive / set-default — resolves
+   * against providers.json and fails with `provider_not_found`. The published
+   * catalog must carry the distinction so the UI can offer only the operations
+   * that can actually succeed instead of rendering controls that must 404.
+   */
+  detected: z.boolean().optional(),
 }).strict()
 
 export type RedactedProviderProfile = z.infer<

@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { logForDebugging } from '../../utils/debug.js'
 import { errorMessage } from '../../utils/errors.js'
+import {
+  registerManagedProcess,
+  terminateProcessTree,
+} from '../../utils/processTermination.js'
 import { PTY_WRAPPER_SOURCE } from './ptyWrapper.py.js'
 
 /**
@@ -29,7 +33,7 @@ export type PtyProcess = {
   /** 向前台进程组发信号（SIGINT 通过 ^C 线路规程，最可靠） */
   signalForeground(sig: 'SIGINT' | 'SIGTERM' | 'SIGKILL'): void
   /** 终止整个终端（wrapper + shell） */
-  kill(): void
+  kill(): Promise<void>
   onData(cb: (data: string) => void): void
   onExit(cb: (exitCode: number | null) => void): void
   readonly alive: boolean
@@ -58,6 +62,7 @@ export function resolveDefaultShell(): string {
 export function spawnPty(opts: PtySpawnOptions): PtyProcess {
   const { script, dir } = ensureWrapper()
   const sizeFile = join(dir, `size-${randomUUID()}`)
+  const childPidFile = join(dir, `child-${randomUUID()}.pid`)
   writeFileSync(sizeFile, `${opts.rows} ${opts.cols}`, 'utf8')
 
   const command = opts.command ?? [resolveDefaultShell(), '-l']
@@ -71,6 +76,7 @@ export function spawnPty(opts: PtySpawnOptions): PtyProcess {
       ...process.env,
       ...opts.env,
       CCB_PTY_SIZE_FILE: sizeFile,
+      CCB_PTY_CHILD_PID_FILE: childPidFile,
       TERM: 'xterm-256color',
       // 避免子 CLI 递归打开终端功能
       CCB_SESSION_TERMINAL: '1',
@@ -81,6 +87,18 @@ export function spawnPty(opts: PtySpawnOptions): PtyProcess {
   })
 
   const decoder = new TextDecoder()
+  const unregisterWrapper = registerManagedProcess(proc.pid, {
+    label: 'terminal-pty-wrapper',
+  })
+  let killPromise: Promise<void> | null = null
+  const readChildPid = (): number | undefined => {
+    try {
+      const parsed = Number(readFileSync(childPidFile, 'utf8').trim())
+      return Number.isSafeInteger(parsed) && parsed > 1 ? parsed : undefined
+    } catch {
+      return undefined
+    }
+  }
   void (async () => {
     try {
       for await (const chunk of proc.stdout) {
@@ -102,8 +120,33 @@ export function spawnPty(opts: PtySpawnOptions): PtyProcess {
       // ignore
     }
   })()
-  void proc.exited.then(code => {
+  void proc.exited.then(async code => {
     alive = false
+    // If the Python wrapper crashed or was externally killed, its forkpty
+    // child is re-parented and would otherwise survive the terminal tab.
+    const orphanedChildPid = killPromise ? undefined : readChildPid()
+    if (orphanedChildPid) {
+      const unregisterOrphan = registerManagedProcess(orphanedChildPid, {
+        label: 'orphaned-terminal-pty-session',
+      })
+      await terminateProcessTree({
+        pid: orphanedChildPid,
+        steps: [
+          { signal: 'SIGHUP', waitMs: 300 },
+          { signal: 'SIGTERM', waitMs: 300 },
+          { signal: 'SIGKILL', waitMs: 700 },
+        ],
+        label: 'orphaned-terminal-pty-session',
+      })
+      unregisterOrphan()
+    }
+    unregisterWrapper()
+    try {
+      unlinkSync(sizeFile)
+    } catch {}
+    try {
+      unlinkSync(childPidFile)
+    } catch {}
     for (const cb of exitCallbacks) cb(code)
   })
 
@@ -157,12 +200,38 @@ export function spawnPty(opts: PtySpawnOptions): PtyProcess {
       }
     },
     kill() {
-      if (!alive) return
-      try {
-        proc.kill('SIGKILL')
-      } catch {
-        // already dead
-      }
+      if (killPromise) return killPromise
+      killPromise = (async () => {
+        const childPid = readChildPid()
+
+        // Give the wrapper the first chance to enumerate the terminal session,
+        // signal its foreground group and reap the forkpty child. The child PID
+        // is captured first so an explicit fallback remains available if the
+        // wrapper crashes or its process-table inspection is restricted.
+        await terminateProcessTree({
+          pid: proc.pid,
+          steps: [
+            { signal: 'SIGTERM', waitMs: 800 },
+            { signal: 'SIGKILL', waitMs: 500 },
+          ],
+          label: 'terminal-pty-wrapper',
+        })
+
+        // The forkpty child creates a new session, so it is outside the Python
+        // wrapper's process group. Reap any surviving tree explicitly.
+        if (childPid) {
+          await terminateProcessTree({
+            pid: childPid,
+            steps: [
+              { signal: 'SIGHUP', waitMs: 300 },
+              { signal: 'SIGTERM', waitMs: 300 },
+              { signal: 'SIGKILL', waitMs: 700 },
+            ],
+            label: 'terminal-pty-session',
+          })
+        }
+      })()
+      return killPromise
     },
     onData(cb) {
       dataCallbacks.push(cb)

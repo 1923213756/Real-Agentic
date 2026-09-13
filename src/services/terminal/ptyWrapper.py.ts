@@ -17,14 +17,85 @@ import os
 import select
 import signal
 import struct
+import subprocess
 import sys
 import termios
+import time
 
 size_file = os.environ.get("CCB_PTY_SIZE_FILE", "")
+child_pid_file = os.environ.get("CCB_PTY_CHILD_PID_FILE", "")
 
 pid, master_fd = os.forkpty()
 if pid == 0:
     os.execvp(sys.argv[1], sys.argv[1:])
+
+if child_pid_file:
+    try:
+        with open(child_pid_file, "w") as f:
+            f.write(str(pid))
+    except Exception:
+        pass
+
+shutdown_signal = None
+
+def descendant_pids(root_pid):
+    try:
+        output = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid="],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return []
+    children = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            child, parent = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(child)
+    result = []
+    visited = {root_pid}
+    def visit(parent):
+        for child in children.get(parent, []):
+            if child in visited:
+                continue
+            visited.add(child)
+            visit(child)
+            result.append(child)
+    visit(root_pid)
+    return result
+
+def signal_child_tree(sig):
+    # Snapshot descendants before signaling the shell so they cannot escape by
+    # being re-parented when the shell exits. Include the foreground process
+    # group because interactive shells place pipelines in a separate group.
+    descendants = descendant_pids(pid)
+    try:
+        foreground_pgid = os.tcgetpgrp(master_fd)
+        if foreground_pgid > 0:
+            os.killpg(foreground_pgid, sig)
+    except Exception:
+        pass
+    for child in descendants:
+        try:
+            os.kill(child, sig)
+        except Exception:
+            pass
+    try:
+        os.kill(pid, sig)
+    except Exception:
+        pass
+
+def request_shutdown(sig, *_args):
+    global shutdown_signal
+    if shutdown_signal is None:
+        shutdown_signal = sig
+        signal_child_tree(sig)
 
 def apply_size(*_args):
     try:
@@ -50,6 +121,8 @@ def fg_signal(sig):
 signal.signal(signal.SIGWINCH, apply_size)
 signal.signal(signal.SIGUSR1, fg_signal(signal.SIGTERM))
 signal.signal(signal.SIGUSR2, fg_signal(signal.SIGKILL))
+signal.signal(signal.SIGTERM, request_shutdown)
+signal.signal(signal.SIGHUP, request_shutdown)
 if size_file:
     apply_size()
 
@@ -64,6 +137,8 @@ def write_all(fd, data):
         view = view[written:]
 
 while True:
+    if shutdown_signal is not None:
+        break
     watch = [master_fd] + ([stdin_fd] if stdin_open else [])
     try:
         rfds, _wfds, _xfds = select.select(watch, [], [])
@@ -95,15 +170,35 @@ while True:
             break
         os.write(master_fd, data)
 
+signal_child_tree(shutdown_signal or signal.SIGHUP)
+deadline = time.monotonic() + 0.6
+status = None
+while time.monotonic() < deadline:
+    try:
+        waited_pid, waited_status = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            status = waited_status
+            break
+    except ChildProcessError:
+        break
+    except Exception:
+        pass
+    time.sleep(0.02)
+
+if status is None:
+    signal_child_tree(signal.SIGKILL)
+    try:
+        _waited_pid, status = os.waitpid(pid, 0)
+    except Exception:
+        status = None
+
 try:
-    os.kill(pid, signal.SIGHUP)
+    if child_pid_file:
+        os.unlink(child_pid_file)
 except Exception:
     pass
-try:
-    _pid, status = os.waitpid(pid, 0)
-    if os.WIFEXITED(status):
-        sys.exit(os.WEXITSTATUS(status))
-    sys.exit(1)
-except Exception:
-    sys.exit(0)
+
+if status is not None and os.WIFEXITED(status):
+    sys.exit(os.WEXITSTATUS(status))
+sys.exit(1 if status is not None else 0)
 `

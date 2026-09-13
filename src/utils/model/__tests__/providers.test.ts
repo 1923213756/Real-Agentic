@@ -28,7 +28,11 @@ function setRuntimeProviderOverride(provider: APIProvider | null): void {
 
 function getAPIProviderTest(settings: { modelType?: string }): APIProvider {
   if (runtimeProviderOverride !== null) return runtimeProviderOverride
-  const modelType = settings.modelType
+  const modelType =
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === '1' ||
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === 'true'
+      ? undefined
+      : settings.modelType
   if (modelType === 'openai') return 'openai'
   if (modelType === 'gemini') return 'gemini'
   if (modelType === 'grok') return 'grok'
@@ -91,6 +95,7 @@ describe('getAPIProvider', () => {
     'CLAUDE_CODE_USE_FOUNDRY',
     'CLAUDE_CODE_USE_OPENAI',
     'CLAUDE_CODE_USE_GROK',
+    'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
     'OPENAI_BASE_URL',
     'GEMINI_BASE_URL',
   ] as const
@@ -117,6 +122,25 @@ describe('getAPIProvider', () => {
 
   test('returns "firstParty" by default', () => {
     expect(getAPIProviderTest({})).toBe('firstParty')
+  })
+
+  test('host-managed routing ignores settings.modelType', () => {
+    // A bridge session launched from the provider catalog owns its routing.
+    // Without this, a terminal-only `modelType: "openai"` outranked the host's
+    // projection and sent an anthropic-compatible provider's traffic to
+    // OPENAI_BASE_URL — the panel showed one vendor, the request hit another.
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    expect(getAPIProviderTest({ modelType: 'openai' })).toBe('firstParty')
+  })
+
+  test('host-managed routing still honours the host projection env', () => {
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    expect(getAPIProviderTest({ modelType: 'gemini' })).toBe('openai')
+  })
+
+  test('settings.modelType still wins when the host is not managing routing', () => {
+    expect(getAPIProviderTest({ modelType: 'openai' })).toBe('openai')
   })
 
   test('runtime override takes precedence and can be cleared', () => {

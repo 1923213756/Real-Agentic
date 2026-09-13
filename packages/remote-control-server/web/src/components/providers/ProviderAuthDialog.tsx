@@ -4,14 +4,20 @@ import {
   apiBeginProviderSecret,
   apiCancelProviderAuth,
   apiFetchProviderAuthStatus,
+  apiFetchProviderOperation,
   apiRefreshProviderAuth,
   apiSubmitProviderSecret,
   apiSubmitProviderAuthCode,
 } from '../../api/client';
-import { ProviderAuthModel, type BrowserProviderAuthStatus } from '../../lib/provider-auth-model';
+import {
+  ProviderAuthModel,
+  PROVIDER_AUTH_ERROR_TEXT,
+  type BrowserProviderAuthStatus,
+} from '../../lib/provider-auth-model';
+import { awaitPendingProviderValue } from '../../lib/provider-pending';
 import { encryptProviderSecret, parseProviderSecretChallenge } from '../../lib/provider-secret';
 import { generateMessageUuid } from '../../lib/utils';
-import type { ProviderCatalogProfile } from '../../types';
+import type { ProviderCatalogProfile, ProviderCatalogResponse } from '../../types';
 
 export function ProviderAuthDialog({
   environmentId,
@@ -37,11 +43,16 @@ export function ProviderAuthDialog({
     const timer = setTimeout(() => {
       void apiFetchProviderAuthStatus(environmentId, status.operationId)
         .then(response => {
+          // A status read that times out falls back to the cached catalog with
+          // no `value`. That is a transient miss, not a dead operation — keep
+          // the last known status and let the next tick retry, instead of
+          // tearing the dialog down mid device-flow.
+          if (response.value === undefined) return;
           const next = model.apply(response);
           setStatus(next);
           if (next.state === 'succeeded') void onChanged();
         })
-        .catch(reason => setError(reason instanceof Error ? reason.message : '认证状态读取失败'));
+        .catch(reason => setError(authErrorText(reason)));
     }, model.pollDelay());
     return () => clearTimeout(timer);
   }, [environmentId, model, onChanged, provider, status]);
@@ -49,9 +60,16 @@ export function ProviderAuthDialog({
   const begin = (method: string) => {
     const operationId = generateMessageUuid();
     setError(null);
+    // The begin handshake is a write, so a Worker slower than the server's
+    // ~1.5s synchronous window answers 202 with no `value`. Feeding that body
+    // straight to model.apply() threw invalid_provider_auth_status and left
+    // `status` null, so the polling effect never started — the device flow was
+    // running on the Worker while the panel showed only an error. Collect the
+    // durable result instead.
     void apiBeginProviderAuth(environmentId, provider.id, { operation_id: operationId, method })
-      .then(response => setStatus(model.apply(response)))
-      .catch(reason => setError(reason instanceof Error ? reason.message : '认证启动失败'));
+      .then(response => awaitPendingProviderValue(environmentId, operationId, response))
+      .then(value => setStatus(model.applyValue(value)))
+      .catch(reason => setError(authErrorText(reason)));
   };
   const close = () => {
     if (status && ['starting', 'waiting'].includes(status.state))
@@ -66,7 +84,6 @@ export function ProviderAuthDialog({
   const saveSecret = async () => {
     if (!secretMethod) return;
     const value = credential;
-    setCredential('');
     setSecretBusy(true);
     setError(null);
     try {
@@ -75,7 +92,7 @@ export function ProviderAuthDialog({
         operation_id: operationId,
         method: secretMethod,
       });
-      const challenge = parseProviderSecretChallenge(response.value);
+      const challenge = parseProviderSecretChallenge(await awaitSecretChallenge(environmentId, operationId, response));
       if (challenge.operationId !== operationId || challenge.expiresAt <= Date.now()) {
         throw new Error('一次性加密通道已失效，请重试');
       }
@@ -85,11 +102,16 @@ export function ProviderAuthDialog({
         method: secretMethod,
         envelope,
       });
+      // Clear only once the credential is actually on the Worker. Clearing up
+      // front meant any failure left an empty input behind, so every retry
+      // encrypted an empty string and died locally — the request never even
+      // left the browser, and the key could never be saved again.
+      setCredential('');
       setSecretMethod(null);
       setSecretSaved(true);
       await onChanged();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '凭据保存失败');
+      setError(secretErrorText(reason));
     } finally {
       setSecretBusy(false);
     }
@@ -192,8 +214,9 @@ export function ProviderAuthDialog({
                   type="button"
                   onClick={() =>
                     void apiSubmitProviderAuthCode(environmentId, status.operationId, code)
-                      .then(response => setStatus(model.apply(response)))
-                      .catch(reason => setError(reason instanceof Error ? reason.message : '提交失败'))
+                      .then(response => awaitPendingProviderValue(environmentId, status.operationId, response))
+                      .then(value => setStatus(model.applyValue(value)))
+                      .catch(reason => setError(authErrorText(reason)))
                   }
                   className="rounded-md bg-brand px-3 py-1.5 text-white"
                 >
@@ -213,6 +236,48 @@ export function ProviderAuthDialog({
       </div>
     </div>
   );
+}
+
+/**
+ * Resolve the one-time encryption challenge from a begin handshake.
+ *
+ * Thin wrapper over the shared pending-write poll: the handshake is a write, so
+ * a Worker slower than the server's synchronous window answers 202 with no
+ * `value` and the challenge only lands in the durable command result.
+ */
+export async function awaitSecretChallenge(
+  environmentId: string,
+  operationId: string,
+  response: ProviderCatalogResponse,
+  fetchOperation: typeof apiFetchProviderOperation = apiFetchProviderOperation,
+  pollIntervalMs?: number,
+): Promise<unknown> {
+  try {
+    return await awaitPendingProviderValue(environmentId, operationId, response, fetchOperation, pollIntervalMs);
+  } catch (reason) {
+    if (reason instanceof Error && reason.message === 'provider_operation_pending_timeout')
+      throw new Error('本地 Worker 未在超时前建立加密通道，请确认它在线后重试');
+    throw reason;
+  }
+}
+
+const SECRET_ERROR_TEXT: Record<string, string> = {
+  invalid_provider_secret: '凭据为空，请重新粘贴后再保存',
+  invalid_provider_secret_challenge: '本地 Worker 返回的加密通道无效，请重试',
+  provider_secret_decryption_failed: '本地 Worker 无法解密该凭据，请重试',
+  provider_secret_operation_not_found: '加密通道已过期，请重试',
+  environment_offline: '本地 Worker 不在线，无法保存凭据',
+};
+
+function secretErrorText(reason: unknown): string {
+  if (!(reason instanceof Error)) return '凭据保存失败';
+  return SECRET_ERROR_TEXT[reason.message] ?? reason.message;
+}
+
+/** Map a thrown auth-flow error to copy, keeping the raw code when unmapped. */
+function authErrorText(reason: unknown): string {
+  if (!(reason instanceof Error)) return '认证启动失败';
+  return PROVIDER_AUTH_ERROR_TEXT[reason.message] ?? reason.message;
 }
 
 type AuthMethodOption = {

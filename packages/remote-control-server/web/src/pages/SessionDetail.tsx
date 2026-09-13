@@ -47,6 +47,7 @@ export function SessionDetail({
   const [session, setSession] = useState<Session | null>(null);
   const [sessionStatus, setSessionStatus] = useState<string | null>(null);
   const [error, setError] = useState('');
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [workCenterWidth, setWorkCenterWidth] = useState(360);
   const [entries, setEntries] = useState<ThreadEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -83,12 +84,16 @@ export function SessionDetail({
         },
         onError: err => {
           console.error('[RCSChatAdapter] error:', err);
+          setRuntimeError(err);
         },
         onPermissionsChange: permissions => {
           setPermissionError(null);
           setPendingPermissions(permissions);
         },
-        onSessionInfo: info => setSessionInfo(info),
+        onSessionInfo: info => {
+          setRuntimeError(null);
+          setSessionInfo(info);
+        },
         onSessionTitle: title => setSession(current => (current ? { ...current, title } : current)),
         onUsage: totals => setUsage(totals),
         onRuntimeChange: nextRuntime => {
@@ -120,6 +125,7 @@ export function SessionDetail({
 
     async function load() {
       setError('');
+      setRuntimeError(null);
       setSessionInfo(null);
       setUsage(null);
       setRuntime(null);
@@ -152,6 +158,7 @@ export function SessionDetail({
       } catch (err) {
         if (controller.signal.aborted || cancelled) return;
         console.warn('Failed to init adapter:', err);
+        setRuntimeError(err instanceof Error ? err.message : '会话同步失败');
         return;
       }
 
@@ -163,6 +170,7 @@ export function SessionDetail({
           await adapter.sendMessage(pending);
         } catch (err) {
           console.error('Failed to send pending message:', err);
+          setRuntimeError(err instanceof Error ? err.message : '发送消息失败');
           setIsLoading(false);
         }
       }
@@ -186,11 +194,13 @@ export function SessionDetail({
     async (message: import('../../src/lib/types').ChatInputMessage) => {
       const text = message.text.trim();
       if (!text || closed) return;
+      setRuntimeError(null);
       setIsLoading(true);
       try {
         await adapter.sendMessage(text, message.images);
       } catch (err) {
         console.error('Send failed:', err);
+        setRuntimeError(err instanceof Error ? err.message : '发送消息失败');
         setIsLoading(false);
       }
     },
@@ -494,6 +504,17 @@ export function SessionDetail({
 
           {/* Chat messages — unified ChatView */}
           <ChatView entries={entries} isLoading={isLoading} emptyTitle="开始对话" emptyDescription="输入消息开始聊天" />
+
+          {runtimeError && (
+            <div className="border-t border-status-error/20 bg-status-error/5 px-4 py-3" role="alert">
+              <div className="mx-auto max-w-3xl rounded-lg border border-status-error/30 bg-surface-1 px-3 py-2.5">
+                <p className="font-display text-xs font-semibold text-status-error">Claude Code 运行失败</p>
+                <p className="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-text-secondary">
+                  {runtimeError}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Unified Permission Panel — above input */}
           {adapterReady && pendingPermissions.length > 0 && (

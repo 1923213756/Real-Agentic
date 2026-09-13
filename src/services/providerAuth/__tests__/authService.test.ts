@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   ProviderAuthService,
+  sanitizeAuthErrorDetail,
   type ProviderAuthDependencies,
 } from '../authService.js'
 import type { OAuthTokens } from '../../oauth/types.js'
@@ -137,5 +138,63 @@ describe('ProviderAuthService', () => {
     await expect(
       service.refresh({ method: 'aws-iam', action: 'aws-refresh' }),
     ).resolves.toBeUndefined()
+  })
+})
+
+describe('auth failure reporting', () => {
+  test('carries the real transport failure through to the status', async () => {
+    // A 403 from auth.openai.com (the Worker has no proxy) used to be reported
+    // as a bare provider_auth_failed, indistinguishable from a rejected
+    // account. Keep the coarse code, but no longer discard the reason.
+    const fixture = dependencies()
+    fixture.deps.requestChatGPTCode = async () => {
+      throw new Error('ChatGPT auth request failed (403): blocked')
+    }
+    const service = new ProviderAuthService(fixture.deps)
+    service.begin({
+      operationId: 'chatgpt-403',
+      providerId: 'chatgpt',
+      method: 'chatgpt-device-oauth',
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(service.get('chatgpt-403')).toMatchObject({
+      state: 'failed',
+      errorCode: 'provider_auth_failed',
+    })
+    expect(service.get('chatgpt-403').errorDetail).toContain('403')
+  })
+
+  test('redacts token-shaped text before it reaches the browser', () => {
+    const jwt = `eyJ${'a'.repeat(40)}`
+    const detail = sanitizeAuthErrorDetail(
+      new Error(`token request failed: ${jwt} and rt.1.${'b'.repeat(30)}`),
+    )
+    expect(detail).not.toContain(jwt)
+    expect(detail).not.toContain('rt.1.')
+    expect(detail).toContain('[redacted]')
+  })
+
+  test('caps an oversized provider error body', () => {
+    const detail = sanitizeAuthErrorDetail(new Error('x'.repeat(1000)))
+    expect(detail!.length).toBeLessThanOrEqual(301)
+  })
+
+  test('still reports the import-unavailable code with its detail', async () => {
+    const fixture = dependencies()
+    fixture.deps.importChatGPTAuth = async () => false
+    const service = new ProviderAuthService(fixture.deps)
+    service.begin({
+      operationId: 'import-missing',
+      providerId: 'chatgpt',
+      method: 'chatgpt-import',
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(service.get('import-missing').errorCode).toBe(
+      'chatgpt_auth_import_unavailable',
+    )
   })
 })

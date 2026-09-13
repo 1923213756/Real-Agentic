@@ -14,6 +14,28 @@ const IMAGE_COMPRESSION_OPTIONS = {
   fileType: 'image/jpeg' as const,
 };
 
+export const MAX_CHAT_INPUT_CHARS = 256 * 1024;
+
+function hasDisallowedControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function getChatInputValidationError(value: string): string | null {
+  if (value.length > MAX_CHAT_INPUT_CHARS) {
+    return `消息不能超过 ${MAX_CHAT_INPUT_CHARS.toLocaleString()} 个字符`;
+  }
+  if (hasDisallowedControlCharacter(value)) {
+    return '消息包含不支持的控制字符，请改用纯文本后重试';
+  }
+  return null;
+}
+
 // =============================================================================
 // Anthropic 风格聊天输入框 — 底部居中浮动卡片，橙色焦点环
 // =============================================================================
@@ -52,6 +74,7 @@ export function ChatInput({
   const [images, setImages] = useState<UserMessageImage[]>([]);
   const [showCommandMenu, setShowCommandMenu] = useState(false);
   const [commandFilter, setCommandFilter] = useState('');
+  const [inputError, setInputError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -69,6 +92,11 @@ export function ChatInput({
   const handleSubmit = useCallback(() => {
     const trimmed = text.trim();
     if ((!trimmed && images.length === 0) || disabled) return;
+    const validationError = getChatInputValidationError(trimmed);
+    if (validationError) {
+      setInputError(validationError);
+      return;
+    }
 
     if (isLoading) setQueuedNotice(true);
     onSubmit({ text: trimmed, images: images.length > 0 ? images : undefined });
@@ -76,6 +104,7 @@ export function ChatInput({
     setImages([]);
     setShowCommandMenu(false);
     setCommandFilter('');
+    setInputError(null);
     // 重置 textarea 高度
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
@@ -118,6 +147,12 @@ export function ChatInput({
   const handleInput = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const value = e.target.value;
+      const validationError = getChatInputValidationError(value);
+      if (validationError) {
+        setInputError(validationError);
+        return;
+      }
+      setInputError(null);
       setText(value);
 
       // 检测 slash 命令模式：仅在输入开头输入 / 时触发
@@ -170,12 +205,13 @@ export function ChatInput({
 
   const handleCommandSelect = useCallback((command: AvailableCommand) => {
     setText(`/${command.name} `);
+    setInputError(null);
     setShowCommandMenu(false);
     setCommandFilter('');
     textareaRef.current?.focus();
   }, []);
 
-  const canSend = (text.trim() || images.length > 0) && !disabled;
+  const canSend = (text.trim() || images.length > 0) && !disabled && !inputError;
 
   return (
     <div className={cn('w-full max-w-3xl mx-auto px-4 sm:px-8 pb-4 pt-2', className)}>
@@ -298,7 +334,11 @@ export function ChatInput({
 
       {/* 提示文本 */}
       <div className="text-center mt-1.5">
-        {queuedNotice ? (
+        {inputError ? (
+          <span className="text-[11px] text-error font-display" role="alert">
+            {inputError}
+          </span>
+        ) : queuedNotice ? (
           <span className="text-[11px] text-brand font-display">
             消息已加入队列 — Claude 会在当前回合的下一个工具间隙看到它
           </span>
