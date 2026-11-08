@@ -768,6 +768,36 @@ export function isPathTrusted(dir: string): boolean {
   }
 }
 
+/** Persist explicit approval for this canonical directory and its descendants. */
+export function saveWorkspaceTrust(dir: string): void {
+  const projectPath = normalizePathForConfigKey(resolve(dir))
+  const update = (current: GlobalConfig): GlobalConfig => ({
+    ...current,
+    projects: {
+      ...current.projects,
+      [projectPath]: {
+        ...(current.projects?.[projectPath] ?? DEFAULT_PROJECT_CONFIG),
+        hasTrustDialogAccepted: true,
+      },
+    },
+  })
+  if (process.env.NODE_ENV === 'test') {
+    Object.assign(
+      TEST_GLOBAL_CONFIG_FOR_TESTING,
+      update(TEST_GLOBAL_CONFIG_FOR_TESTING),
+    )
+    return
+  }
+  let written: GlobalConfig | undefined
+  const saved = saveConfigWithLock(
+    getGlobalClaudeFile(),
+    createDefaultGlobalConfig,
+    current => (written = update(current)),
+  )
+  if (!saved || !written) throw new Error('Unable to save workspace trust')
+  writeThroughGlobalConfigCache(written)
+}
+
 // We have to put this test code here because Jest doesn't support mocking ES modules :O
 const TEST_GLOBAL_CONFIG_FOR_TESTING: GlobalConfig = {
   ...DEFAULT_GLOBAL_CONFIG,

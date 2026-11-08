@@ -43,6 +43,7 @@ export function isProviderEnvironmentCommandKind(
 
 export type RemoteDirectoryListing = {
   path: string
+  trusted?: boolean
   entries: Array<{
     name: string
     kind: 'directory' | 'file'

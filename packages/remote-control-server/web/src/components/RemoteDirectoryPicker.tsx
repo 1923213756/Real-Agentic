@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowUp, ChevronRight, File, Folder, Loader2, RefreshCw, Server } from 'lucide-react';
-import { apiListRemoteDirectory } from '../api/client';
+import { apiListRemoteDirectory, apiTrustRemoteWorkspace } from '../api/client';
 import type { Environment } from '../types';
 import {
   applyDirectoryError,
@@ -25,6 +25,33 @@ export function RemoteDirectoryPicker({ environment, value, onChange }: RemoteDi
   const initialPath = useMemo(() => value.trim() || environment.directory?.trim() || '/', [environment.id]);
   const [state, setState] = useState(() => createRemoteDirectoryState(initialPath));
   const [refreshKey, setRefreshKey] = useState(0);
+  const [trustBusy, setTrustBusy] = useState(false);
+  const [trustError, setTrustError] = useState('');
+  const [trustConfirmed, setTrustConfirmed] = useState(false);
+  const targetRef = useRef('');
+  targetRef.current = `${environment.id}\0${state.requestedPath}`;
+
+  useEffect(() => {
+    setTrustConfirmed(false);
+    setTrustError('');
+  }, [environment.id, state.requestedPath]);
+
+  const trustWorkspace = async () => {
+    const path = state.canonicalPath;
+    if (!path || !trustConfirmed || trustBusy || !canConfirmWorkspace(state)) return;
+    const target = targetRef.current;
+    setTrustBusy(true);
+    setTrustError('');
+    try {
+      await apiTrustRemoteWorkspace(environment.id, path);
+      if (targetRef.current !== target) return;
+      setState(current => (current.canonicalPath === path ? { ...current, trusted: true } : current));
+    } catch (error) {
+      if (targetRef.current === target) setTrustError(error instanceof Error ? error.message : '保存信任失败');
+    } finally {
+      setTrustBusy(false);
+    }
+  };
 
   useEffect(() => {
     setState(createRemoteDirectoryState(initialPath));
@@ -35,6 +62,7 @@ export function RemoteDirectoryPicker({ environment, value, onChange }: RemoteDi
     const requestedPath = state.requestedPath;
     void apiListRemoteDirectory(environment.id, requestedPath, controller.signal)
       .then(listing => {
+        if (controller.signal.aborted) return;
         setState(current => (current.requestedPath === requestedPath ? applyListing(current, listing) : current));
       })
       .catch(error => {
@@ -142,6 +170,43 @@ export function RemoteDirectoryPicker({ environment, value, onChange }: RemoteDi
           '只有成功读取的文件夹可以作为 Code 工作区'
         )}
       </div>
+      {canConfirmWorkspace(state) && (
+        <div className="border-t border-border px-3 py-3 font-display text-xs">
+          {state.trusted === true ? (
+            <p className="text-brand">此工作区已信任，可以创建会话。</p>
+          ) : (
+            <>
+              <p className="mb-2 text-text-secondary">
+                此目录尚未信任。确认后可直接作为工作区，无需再去终端确认目录信任。
+              </p>
+              <label className="flex items-start gap-2 text-text-secondary">
+                <input
+                  type="checkbox"
+                  checked={trustConfirmed}
+                  disabled={trustBusy}
+                  onChange={event => setTrustConfirmed(event.target.checked)}
+                />
+                <span>
+                  我信任上方目录及其子目录中的文件和项目配置，允许智能体在工具权限范围内读取、编辑文件和执行命令。
+                </span>
+              </label>
+              <button
+                type="button"
+                disabled={!trustConfirmed || trustBusy}
+                onClick={() => void trustWorkspace()}
+                className="mt-3 rounded-md bg-brand px-3 py-1.5 text-white disabled:opacity-40"
+              >
+                {trustBusy ? '正在保存…' : '信任此目录'}
+              </button>
+              {trustError && (
+                <p role="alert" className="mt-2 text-status-error">
+                  {trustError}
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

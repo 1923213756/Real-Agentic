@@ -61,7 +61,11 @@ describe('product runtime workspace inspection', () => {
     const realPath = join(root, 'repo')
     const aliasPath = join(root, 'repo-link')
     mkdirSync(realPath)
-    symlinkSync(realPath, aliasPath, 'dir')
+    symlinkSync(
+      realPath,
+      aliasPath,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    )
 
     const resolved = await resolveRemoteWorkspace(aliasPath, 'device-1', {
       isPathTrusted: () => true,
@@ -85,6 +89,52 @@ describe('product runtime workspace inspection', () => {
     await expect(
       resolveRemoteWorkspace(root, 'device-1', { isPathTrusted: () => false }),
     ).rejects.toThrow(/trusted/i)
+  })
+
+  test('persists trust only after explicit approval of the canonical directory', async () => {
+    const root = realpathSync(makeTempRoot('workspace-approval-'))
+    const { isPathTrusted } = await import('../../utils/config.js')
+    expect(isPathTrusted(root)).toBe(false)
+    await expect(resolveRemoteWorkspace(root, 'device-1')).rejects.toThrow(
+      /not trusted/,
+    )
+    expect(isPathTrusted(root)).toBe(false)
+    expect(
+      (await resolveRemoteWorkspace(root, 'device-1', {}, true)).canonicalPath,
+    ).toBe(root)
+    expect(isPathTrusted(root)).toBe(true)
+    expect((await resolveRemoteWorkspace(root, 'device-1')).canonicalPath).toBe(
+      root,
+    )
+    expect(isPathTrusted(join(root, 'child'))).toBe(true)
+    expect(isPathTrusted(makeTempRoot('workspace-unapproved-'))).toBe(false)
+  })
+
+  test('never accepts approval of a symlink instead of its reviewed canonical target', async () => {
+    const root = makeTempRoot('workspace-approval-link-')
+    const target = join(root, 'target')
+    const alias = join(root, 'alias')
+    mkdirSync(target)
+    symlinkSync(
+      target,
+      alias,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    )
+    let writes = 0
+    await expect(
+      resolveRemoteWorkspace(
+        alias,
+        'device-1',
+        {
+          isPathTrusted: () => false,
+          saveWorkspaceTrust: () => {
+            writes++
+          },
+        },
+        true,
+      ),
+    ).rejects.toThrow(/path changed/)
+    expect(writes).toBe(0)
   })
 
   test('executes probe and cleanup commands with structured results', async () => {

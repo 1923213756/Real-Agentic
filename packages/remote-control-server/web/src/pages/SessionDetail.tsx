@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { apiFetchSession, apiSendControl } from '../api/client';
-import { takePendingMessage, takePendingModel } from '../shell/createSession';
+import { apiFetchProviderCatalog, apiFetchSession, apiSendControl } from '../api/client';
+import { storePendingModel, takePendingMessage, takePendingModel } from '../shell/createSession';
+import { applyInitialSessionModel } from '../lib/initial-session-model';
 import type { Environment, Product, Session, SessionInitInfo, SessionModelSelection, TokenUsageTotals } from '../types';
 import { isClosedSessionStatus } from '../lib/utils';
 import { WorkCenter } from '../components/TaskPanel';
@@ -154,6 +155,24 @@ export function SessionDetail({
           live: !isClosedSessionStatus(sess.status),
         });
         if (!initialized || cancelled) return;
+        const pendingModel = isClosedSessionStatus(sess.status) ? null : takePendingModel(sessionId);
+        if (pendingModel) {
+          try {
+            const environmentId = sess.runtime_environment_id ?? sess.environment_id;
+            if (!environmentId) throw new Error('模型切换缺少运行环境');
+            await applyInitialSessionModel(
+              pendingModel,
+              async () =>
+                parseProviderModelCatalog((await apiFetchProviderCatalog(environmentId, controller.signal)).catalog),
+              input => adapter.setProviderModel(input),
+            );
+            if (cancelled) return;
+            setSession(await apiFetchSession(sessionId));
+          } catch (error) {
+            storePendingModel(sessionId, pendingModel);
+            throw error;
+          }
+        }
         setReadySessionId(sessionId);
       } catch (err) {
         if (controller.signal.aborted || cancelled) return;
@@ -297,23 +316,6 @@ export function SessionDetail({
     },
     [adapter, adapterReady, closed],
   );
-
-  // CodeHome 选择的模型通过 sessionStorage 暂存，adapter 与模型目录就绪后应用到本会话
-  const pendingModelAppliedRef = useRef(false);
-  useEffect(() => {
-    pendingModelAppliedRef.current = false;
-  }, [sessionId]);
-  useEffect(() => {
-    if (pendingModelAppliedRef.current) return;
-    if (!adapterReady || !providerCatalog) return;
-    const pending = takePendingModel(sessionId);
-    pendingModelAppliedRef.current = true;
-    if (!pending || providerCatalog.features.runtimeSwitch !== true) return;
-    const match = buildSessionModelOptions(providerCatalog).find(
-      option => option.providerId === pending.providerId && option.modelProfileId === pending.modelProfileId,
-    );
-    if (match) void handleSetProviderModel(match, providerCatalog.revision);
-  }, [adapterReady, providerCatalog, sessionId, handleSetProviderModel]);
 
   // Permission actions
   const handleApprovePermission = useCallback(

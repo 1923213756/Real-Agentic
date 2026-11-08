@@ -23,6 +23,7 @@ export type RemoteDirectoryEntry = {
 
 export type RemoteDirectoryListing = {
   path: string
+  trusted?: boolean
   entries: RemoteDirectoryEntry[]
 }
 
@@ -48,6 +49,7 @@ export type EnvironmentCommandResult =
 
 type ResolveWorkspaceDependencies = {
   isPathTrusted?: (path: string) => boolean
+  saveWorkspaceTrust?: (path: string) => void
 }
 
 type ExecuteEnvironmentCommandDependencies = {
@@ -281,10 +283,25 @@ export async function resolveRemoteWorkspace(
   requestedPath: string,
   deviceId: string,
   dependencies: ResolveWorkspaceDependencies = {},
+  trustConfirmed = false,
 ): Promise<ResolvedRemoteWorkspace> {
   const canonicalPath = await realpath(requestedPath)
   if (!(await stat(canonicalPath)).isDirectory()) {
     throw new Error(`Remote path is not a directory: ${requestedPath}`)
+  }
+
+  if (trustConfirmed) {
+    // Approval must name the canonical directory shown by the picker. Do not
+    // trust a symlink that may have been retargeted after the user reviewed it.
+    if (resolve(requestedPath) !== canonicalPath) {
+      throw new Error(
+        'Workspace path changed; refresh the directory and confirm again',
+      )
+    }
+    const saveTrust =
+      dependencies.saveWorkspaceTrust ??
+      (await import('../utils/config.js')).saveWorkspaceTrust
+    saveTrust(canonicalPath)
   }
 
   const isPathTrusted =
@@ -397,12 +414,21 @@ export async function executeEnvironmentCommand(
     case 'list_directory':
       return {
         kind: command.type,
-        value: await listRemoteDirectory(command.path),
+        value: await (async () => {
+          const listing = await listRemoteDirectory(command.path)
+          const { isPathTrusted } = await import('../utils/config.js')
+          return { ...listing, trusted: isPathTrusted(listing.path) }
+        })(),
       }
     case 'resolve_workspace':
       return {
         kind: command.type,
-        value: await resolveRemoteWorkspace(command.path, command.device_id),
+        value: await resolveRemoteWorkspace(
+          command.path,
+          command.device_id,
+          {},
+          command.trust_confirmed === true,
+        ),
       }
     case 'probe_workspace':
       try {

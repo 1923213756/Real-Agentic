@@ -5,6 +5,7 @@ export interface RemoteDirectoryState {
   requestedPath: string
   validatedInputPath: string | null
   canonicalPath: string | null
+  trusted?: boolean
   entries: RemoteDirectoryEntry[]
   backStack: string[]
   loading: boolean
@@ -18,6 +19,7 @@ export function createRemoteDirectoryState(path: string): RemoteDirectoryState {
     requestedPath: initialPath,
     validatedInputPath: null,
     canonicalPath: null,
+    trusted: undefined,
     entries: [],
     backStack: [],
     loading: true,
@@ -47,6 +49,7 @@ function requestPath(
     requestedPath: path,
     validatedInputPath: null,
     canonicalPath: null,
+    trusted: undefined,
     entries: [],
     backStack: pushHistory
       ? [...state.backStack, state.requestedPath]
@@ -91,6 +94,7 @@ export function refreshDirectory(
     ...state,
     validatedInputPath: null,
     canonicalPath: null,
+    trusted: undefined,
     loading: true,
     error: null,
   }
@@ -104,6 +108,7 @@ export function applyListing(
     ...state,
     validatedInputPath: state.requestedPath,
     canonicalPath: listing.path,
+    trusted: listing.trusted,
     entries: [...listing.entries].sort((left, right) => {
       if (left.kind !== right.kind) return left.kind === 'directory' ? -1 : 1
       return left.name.localeCompare(right.name)
@@ -121,6 +126,7 @@ export function applyDirectoryError(
     ...state,
     validatedInputPath: null,
     canonicalPath: null,
+    trusted: undefined,
     entries: [],
     loading: false,
     error,
@@ -132,6 +138,7 @@ export function canConfirmWorkspace(state: RemoteDirectoryState): boolean {
     !state.loading &&
     !state.error &&
     state.validatedInputPath === state.requestedPath &&
+    state.pathInput.trim() === state.requestedPath &&
     state.canonicalPath !== null
   )
 }

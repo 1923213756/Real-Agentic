@@ -82,6 +82,7 @@ export async function createSessionWithFirstMessage(options: {
 export async function createChatSessionWithFirstMessage(options: {
   text: string
   projectId?: string | null
+  model?: PendingModelSelection | null
 }): Promise<Session> {
   const text = options.text.trim()
   const session = await apiCreateChatSession({
@@ -89,6 +90,7 @@ export async function createChatSessionWithFirstMessage(options: {
     project_id: options.projectId ?? null,
   })
   storePendingMessage(session.id, text)
+  if (options.model) storePendingModel(session.id, options.model)
   return session
 }
 
@@ -133,7 +135,10 @@ export function takePendingMessage(sessionId: string): string | null {
   }
 }
 
-function storePendingModel(sessionId: string, model: PendingModelSelection) {
+export function storePendingModel(
+  sessionId: string,
+  model: PendingModelSelection,
+) {
   try {
     sessionStorage.setItem(
       PENDING_MODEL_KEY_PREFIX + sessionId,

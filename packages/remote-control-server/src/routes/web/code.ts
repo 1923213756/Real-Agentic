@@ -184,6 +184,39 @@ app.post('/code/environments/:id/directory', uuidAuth, async c => {
   }
 })
 
+app.post('/code/environments/:id/workspace-trust', uuidAuth, async c => {
+  try {
+    const environmentId = c.req.param('id')!
+    const environment = storeGetEnvironment(environmentId)
+    if (
+      !environment ||
+      environment.status !== 'active' ||
+      environment.workerType === 'acp' ||
+      !environment.deviceId ||
+      environment.accountId !== c.get('accountId')!
+    ) {
+      throw new Error('environment not found or offline')
+    }
+    const body = (await c.req.json()) as { path?: unknown; confirmed?: unknown }
+    if (body.confirmed !== true)
+      throw new Error('explicit workspace trust confirmation is required')
+    const path = typeof body.path === 'string' ? body.path.trim() : ''
+    if (!path) throw new Error('path is required')
+    const result = await runEnvironmentCommand<EnvironmentCommandResult>({
+      environmentId,
+      ownerId: c.get('uuid')!,
+      kind: 'resolve_workspace',
+      payload: { path, deviceId: environment.deviceId, trustConfirmed: true },
+    })
+    if (result.kind !== 'resolve_workspace')
+      throw new Error('invalid workspace result')
+    return c.json({ path: result.value.canonicalPath, trusted: true }, 200)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'invalid request'
+    return c.json({ error: { type: 'invalid_request', message } }, 400)
+  }
+})
+
 app.delete('/code/projects/:id', uuidAuth, c => {
   try {
     return c.json(

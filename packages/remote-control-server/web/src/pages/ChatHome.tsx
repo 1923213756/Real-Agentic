@@ -6,7 +6,8 @@ import { createChatSessionWithFirstMessage } from '../shell/createSession';
 import { apiCreateChatProject } from '../api/client';
 import type { Project } from '../types';
 import type { Environment } from '../types';
-import { environmentDefaultModelLabel } from '../lib/session-model-options';
+import { buildSessionModelOptions, environmentDefaultModelLabel } from '../lib/session-model-options';
+import { parseProviderModelCatalog } from '../lib/provider-catalog-model';
 
 const STARTERS: { icon: React.ReactNode; label: string; prompt: string }[] = [
   { icon: <Pencil className="h-3.5 w-3.5" />, label: '写作', prompt: '帮我写一段文字：' },
@@ -43,6 +44,26 @@ export function ChatHome({ environments = [], projects = [], onCreated, onProjec
     [environments],
   );
   const defaultModelLabel = useMemo(() => environmentDefaultModelLabel(chatEnvironment), [chatEnvironment]);
+  const [modelKey, setModelKey] = useState('');
+  const modelOptions = useMemo(() => {
+    const value = chatEnvironment?.capabilities?.provider_model_catalog_v1;
+    if (!value) return [];
+    try {
+      const catalog = parseProviderModelCatalog(value);
+      return catalog.features.runtimeSwitch ? buildSessionModelOptions(catalog) : [];
+    } catch {
+      return [];
+    }
+  }, [chatEnvironment]);
+  const selectedModel = modelOptions.find(
+    option => JSON.stringify([option.providerId, option.modelProfileId]) === modelKey,
+  );
+  useEffect(() => {
+    setModelKey('');
+  }, [chatEnvironment?.id]);
+  useEffect(() => {
+    if (modelKey && !selectedModel) setModelKey('');
+  }, [modelKey, selectedModel]);
 
   useEffect(() => {
     if (projectId && !projects.some(project => project.id === projectId && project.state === 'active')) {
@@ -56,13 +77,19 @@ export function ChatHome({ environments = [], projects = [], onCreated, onProjec
     setCreating(true);
     setError('');
     try {
-      const session = await createChatSessionWithFirstMessage({ text: trimmed, projectId });
+      const session = await createChatSessionWithFirstMessage({
+        text: trimmed,
+        projectId,
+        model: selectedModel
+          ? { providerId: selectedModel.providerId, modelProfileId: selectedModel.modelProfileId }
+          : null,
+      });
       onCreated(session.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : '创建会话失败');
       setCreating(false);
     }
-  }, [text, projectId, creating, onCreated]);
+  }, [text, projectId, creating, onCreated, selectedModel]);
 
   const handleCreateProject = async () => {
     const name = projectName.trim();
@@ -116,9 +143,35 @@ export function ChatHome({ environments = [], projects = [], onCreated, onProjec
         </div>
 
         <div className="mb-3 flex items-center justify-end gap-2">
-          <span className="mr-auto font-display text-[11px] text-text-muted">
-            新对话模型：{defaultModelLabel ?? 'CLI 默认模型'}
-          </span>
+          <div className="mr-auto min-w-0 flex-1">
+            <label htmlFor="chat-model-select" className="block font-display text-[11px] text-text-muted">
+              新对话模型
+            </label>
+            <select
+              id="chat-model-select"
+              aria-label="选择新对话模型"
+              value={modelKey}
+              disabled={creating || modelOptions.length === 0}
+              onChange={event => setModelKey(event.target.value)}
+              className="w-full max-w-[280px] rounded-lg border border-border bg-surface-1 px-2 py-1.5 font-display text-xs text-text-primary"
+            >
+              <option value="">{defaultModelLabel ? `环境默认：${defaultModelLabel}` : '沿用 CLI 默认模型'}</option>
+              {modelOptions.map(option => (
+                <option
+                  key={JSON.stringify([option.providerId, option.modelProfileId])}
+                  value={JSON.stringify([option.providerId, option.modelProfileId])}
+                >
+                  {option.label}
+                  {option.unverified ? ' · 未验证' : ''}
+                </option>
+              ))}
+            </select>
+            {modelOptions.length === 0 && (
+              <a href="/code/providers#chat" className="mt-1 block text-xs text-brand">
+                添加或验证模型
+              </a>
+            )}
+          </div>
           <label htmlFor="chat-project-select" className="font-display text-sm text-text-muted">
             项目
           </label>

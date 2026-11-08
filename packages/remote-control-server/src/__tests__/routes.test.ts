@@ -1850,6 +1850,69 @@ describe('Product Web Routes', () => {
     })
   })
 
+  test('requires explicit confirmation and environment ownership before trusting a workspace', async () => {
+    const environment = storeCreateEnvironment({
+      secret: 'secret',
+      accountId: 'web:user-1',
+      deviceId: 'device-1',
+    })
+    const url = `/web/code/environments/${environment.id}/workspace-trust`
+    for (const [uuid, body] of [
+      ['user-1', { path: '/workspace' }],
+      ['user-2', { path: '/workspace', confirmed: true }],
+    ] as const) {
+      const response = await app.request(`${url}?uuid=${uuid}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      expect(response.status).toBe(400)
+      expect(
+        getPersistence().listPendingEnvironmentCommands(environment.id),
+      ).toHaveLength(0)
+    }
+    const responsePromise = app.request(`${url}?uuid=user-1`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/workspace', confirmed: true }),
+    })
+    let command = getPersistence().listPendingEnvironmentCommands(
+      environment.id,
+    )[0]
+    for (let attempt = 0; !command && attempt < 20; attempt++) {
+      await Bun.sleep(1)
+      command = getPersistence().listPendingEnvironmentCommands(
+        environment.id,
+      )[0]
+    }
+    expect(command?.kind).toBe('resolve_workspace')
+    expect(command?.payload).toEqual({
+      path: '/workspace',
+      deviceId: 'device-1',
+      trustConfirmed: true,
+    })
+    completeEnvironmentCommand({
+      commandId: command!.id,
+      environmentId: environment.id,
+      result: {
+        kind: 'resolve_workspace',
+        value: {
+          deviceId: 'device-1',
+          canonicalPath: '/workspace',
+          workspaceKey: 'w-1',
+          gitRoot: null,
+          gitRepoUrl: null,
+        },
+      },
+    })
+    const response = await responsePromise
+    expect(response.status).toBe(200)
+    expect(await resJson(response)).toEqual({
+      path: '/workspace',
+      trusted: true,
+    })
+  })
+
   test('rejects cross-account Code environments and requires Chat sandbox capability', async () => {
     const otherEnvironment = storeCreateEnvironment({
       secret: 'other',

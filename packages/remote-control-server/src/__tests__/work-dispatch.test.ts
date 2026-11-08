@@ -472,6 +472,30 @@ describe('Work Dispatch', () => {
       expect(decoded.use_code_sessions).toBe(false)
     })
 
+    test('forwards workspace approval only when it is explicitly true', async () => {
+      for (const approval of [undefined, 'true', true]) {
+        createEnvironmentCommand({
+          environmentId: envId,
+          ownerId: 'owner-1',
+          kind: 'resolve_workspace',
+          payload: {
+            path: '/workspace',
+            deviceId: 'device-1',
+            trustConfirmed: approval,
+          },
+        })
+        const work = await pollWork(envId, 1)
+        expect(work?.data).toMatchObject({
+          type: 'resolve_workspace',
+          path: '/workspace',
+          device_id: 'device-1',
+        })
+        expect(
+          (work?.data as { trust_confirmed?: boolean }).trust_confirmed,
+        ).toBe(approval === true ? true : undefined)
+      }
+    })
+
     test('maps provider mutations to explicit snake-case work data', async () => {
       const command = createEnvironmentCommand({
         environmentId: envId,

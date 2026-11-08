@@ -187,6 +187,7 @@ export interface RemoteDirectoryEntry {
 
 export interface RemoteDirectoryListing {
   path: string
+  trusted?: boolean
   entries: RemoteDirectoryEntry[]
 }
 

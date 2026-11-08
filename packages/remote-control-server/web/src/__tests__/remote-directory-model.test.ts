@@ -12,6 +12,24 @@ import {
 } from '../lib/remote-directory-model'
 
 describe('remote directory model', () => {
+  test('does not carry trust approval to a different directory', () => {
+    const trusted = applyListing(createRemoteDirectoryState('/workspace'), {
+      path: '/workspace',
+      trusted: true,
+      entries: [{ name: 'src', kind: 'directory' }],
+    })
+    expect(trusted.trusted).toBe(true)
+    expect(canConfirmWorkspace(setPathInput(trusted, '/not-reviewed'))).toBe(
+      false,
+    )
+    const changed = requestPathInput(setPathInput(trusted, '/other'))
+    expect(changed.trusted).toBeUndefined()
+    expect(canConfirmWorkspace(changed)).toBe(false)
+    expect(
+      applyListing(changed, { path: '/other', trusted: false, entries: [] })
+        .trusted,
+    ).toBe(false)
+  })
   test('enters directories but never files', () => {
     const state = applyListing(createRemoteDirectoryState('/workspace'), {
       path: '/workspace',

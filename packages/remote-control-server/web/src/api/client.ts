@@ -651,6 +651,14 @@ export function apiListRemoteDirectory(
   )
 }
 
+export function apiTrustRemoteWorkspace(environmentId: string, path: string) {
+  return api<{ path: string; trusted: boolean }>(
+    'POST',
+    `/web/code/environments/${segment(environmentId)}/workspace-trust`,
+    { path, confirmed: true },
+  )
+}
+
 /** Code project deletion is archive-only; the server exposes this as DELETE. */
 export function apiArchiveCodeProject(projectId: string) {
   return api<Project>('DELETE', `/web/code/projects/${projectId}`)

@@ -226,6 +226,18 @@ describe('api functions', () => {
     })
   })
 
+  test('sends explicit trust approval for the selected canonical workspace', async () => {
+    fetchMock.responseData = { path: '/workspace', trusted: true }
+    await client.apiTrustRemoteWorkspace('env-1', '/workspace')
+    expect(fetchMock.lastUrl).toContain(
+      '/web/code/environments/env-1/workspace-trust?',
+    )
+    expect(JSON.parse(fetchMock.lastOpts.body as string)).toEqual({
+      path: '/workspace',
+      confirmed: true,
+    })
+  })
+
   test('uses encoded provider paths and explicit default mutation fields', async () => {
     fetchMock.responseData = {
       stale: false,

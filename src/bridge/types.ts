@@ -40,7 +40,12 @@ export type SessionWorkData = {
 
 export type EnvironmentCommandWorkData =
   | { type: 'list_directory'; path: string }
-  | { type: 'resolve_workspace'; path: string; device_id: string }
+  | {
+      type: 'resolve_workspace'
+      path: string
+      device_id: string
+      trust_confirmed?: boolean
+    }
   | {
       type: 'cleanup_chat_session'
       data_directory: string

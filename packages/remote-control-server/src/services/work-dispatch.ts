@@ -286,6 +286,9 @@ function environmentCommandToWork(
         type: command.kind,
         path: String(command.payload.path ?? ''),
         device_id: String(command.payload.deviceId ?? ''),
+        ...(command.payload.trustConfirmed === true
+          ? { trust_confirmed: true }
+          : {}),
       }
       break
     case 'cleanup_chat_session':
