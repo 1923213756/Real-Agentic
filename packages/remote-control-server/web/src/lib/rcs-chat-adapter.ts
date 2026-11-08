@@ -547,7 +547,8 @@ export class RCSChatAdapter {
     maxTokens: number | null,
   ): Promise<ControlRequestResult> {
     return this.sendControlRequest('set_max_thinking_tokens', {
-      max_thinking_tokens: maxTokens,
+      // CLI treats null as reset-to-default; zero explicitly disables thinking.
+      max_thinking_tokens: maxTokens ?? 0,
     })
   }
 

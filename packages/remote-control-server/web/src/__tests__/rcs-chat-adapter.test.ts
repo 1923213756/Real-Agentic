@@ -93,6 +93,25 @@ function createHarness(
   return { adapter, getEntries: () => entries }
 }
 
+test('thinking toggle sends explicit disable rather than resetting CLI defaults', async () => {
+  const { adapter } = createHarness()
+  const requests: Array<{ subtype: string; params: Record<string, unknown> }> =
+    []
+  adapter.sendControlRequest = async (subtype, params = {}) => {
+    requests.push({ subtype, params })
+    return { ok: true }
+  }
+  await adapter.setMaxThinkingTokens(null)
+  await adapter.setMaxThinkingTokens(16000)
+  expect(requests).toEqual([
+    { subtype: 'set_max_thinking_tokens', params: { max_thinking_tokens: 0 } },
+    {
+      subtype: 'set_max_thinking_tokens',
+      params: { max_thinking_tokens: 16000 },
+    },
+  ])
+})
+
 function assistantText(entries: ThreadEntry[]): string {
   return entries
     .filter(entry => entry.type === 'assistant_message')
